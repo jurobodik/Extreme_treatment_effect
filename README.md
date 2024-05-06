@@ -1,5 +1,5 @@
 # Extreme_treatment_effect
-Supplementary material using R code for the manuscript "Extreme Treatment Effect: Extrapolating Dose Response Function Into Extreme Treatment Domain"
+Supplementary material using R code for the manuscript "Extreme Treatment Effect: Extrapolating Dose-Response Function Into Extreme Treatment Domain."
 
 You can find the following files here:
 

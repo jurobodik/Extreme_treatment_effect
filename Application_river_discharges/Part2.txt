@@ -1,0 +1,369 @@
+# PART2 River discharges application (Precipitation effect)
+# Data are uploaded from three different files. One file contains discharges, second precipitation and the third one contains other covariates
+# Data upload and cleaning is in lines 1-100. The output is a function read_pair that returns a data.frame of river_discharges and covariates with erased NA data (NA were present only at the beginning or the end of each dataset so no bias is present due to missing values)
+
+
+library(quantreg)
+library(raster)
+library(ambient)
+library(dplyr)
+library(rgl)
+library(evgam)
+library(mgcv)
+library(Pareto)
+library(evmix)
+library(boot)
+library(copula)
+library(MASS)
+library("readxl")
+library(zoo)
+
+
+
+discharges = read.csv(file = 'River_discharges_application/Discharges_summer.csv')
+discharges_info = read.csv(file = 'River_discharges_application/Discharges_info_merged.csv')
+
+precipitation = read.csv(file = 'River_discharges_application/precip.csv')
+precipitation_info = read.csv(file = 'River_discharges_application/precip_info.csv')
+names(precipitation)[1] = 'Date'
+
+
+meteo_stations_data = read.csv(file = 'River_discharges_application/order_118359_data.txt', sep = ';')
+names(meteo_stations_data) = c('Name', 
+                               'Date', 
+                               'Gust peak (one second); daily maximum', 
+                               'Vapour pressure 2 m above ground; daily mean', 
+                               'Air temperature 2 m above ground; daily maximum', 
+                               'Relative air humidity 2 m above ground; daily maximum', 
+                               'Cloud cover; daily mean', 
+                               'Atmospheric pressure at barometric altitude (QFE); daily maximum', 
+                               'Pressure reduced to sea level (QFF); daily maximum', 
+                               'Reference evaporation from FAO; daily total', 
+                               'Sunshine duration; daily total')
+meteo_stations_data$Date = as.Date(as.character(meteo_stations_data$Date), format = "%Y%m%d")
+meteo_stations_data$Month <- as.integer(format(meteo_stations_data$Date, "%m"))
+meteo_stations_data$Year <- lubridate::year(meteo_stations_data$Date)
+
+# Subset dataframe to include only months before year 2015
+meteo_stations_data = subset(meteo_stations_data, Year < 2015)
+meteo_stations_data = subset(meteo_stations_data, Month %in% c(6, 7, 8))
+meteo_stations_data = meteo_stations_data[,1:(ncol(meteo_stations_data)-2)]
+
+
+
+
+for (i in 1:nrow(meteo_stations_data)) {
+  for (j in 3:ncol(meteo_stations_data)) {
+    if(meteo_stations_data[i,j]== "-") meteo_stations_data[i,j]=NA
+  } }
+
+
+read_station <- function(station, meteostation, minimum_number_of_observation=5000){
+  
+  z1=discharges[,c(1,station+1)]; z1$Date = as.Date(z1$Date)
+  z2=precipitation[, c(1, which(names(precipitation) == meteostation)  )]; z2$Date = as.Date(z2$Date)
+  z2$running_sum_z2 <- data.frame(rollapply(z2[,2], width = 3, FUN = sum, align = "right", fill = NA))
+  z2$running_sum_z2 = c(NA, NA, as.numeric( z2$running_sum_z2[[1]][1:(nrow( z2$running_sum_z2)-2)]))
+  z2$rain_yesterday = c(NA, as.numeric( z2[1:(nrow(z2)-1),2]))
+  
+  
+  meteo_for_station = meteo_stations_data[meteo_stations_data$Name=='LUZ',]
+  meteo_for_station = meteo_for_station[,colSums(!is.na(meteo_for_station))>minimum_number_of_observation]
+  meteo_for_station$Date = meteo_for_station$Date +2
+
+  merged_df <- merge(z1, z2, by = "Date", all = TRUE)
+
+  names(merged_df) = c('Date', 'y', 'precip', 'running_sum_precip_from_2days_ago_to_week_ago', 'precip_yesterday')
+  merged_df <- merge(merged_df, meteo_for_station, by = "Date", all = TRUE)
+  data = subset(na.omit(merged_df), select = -c(Name))
+  
+  for (j in 2:ncol(data)) {data[,j] = as.numeric(data[,j])  } 
+  return(data)
+}
+
+
+
+
+
+
+#Names of the stations are the following:
+#Station1 = 64
+#Station2 = 63
+#Station3 = 42
+#Station4 = 36
+#Station5 = 34
+#M1 = 'MUR'
+#M2 = 'LUZ'
+#M3 = 'ENT' is another station that is closer to the Station36 but does not contain all relevant confounders. Hence, we only took precipitation from this meteostation and rest from LUZ station. For simplicity this was not mentioned in the manuscript
+
+data = read_station(42, 'LUZ')  #Station3
+#data = read_station(64, 'MUR') #Station1
+#data = read_station(63, 'MUR') #Station2
+#data = read_station(36, 'ENT') #Station4 see comment above about #M3 = 'ENT'
+#data = read_station(34, 'LUZ') #Station5
+
+y  = data$y
+t  = data$precip_yesterday
+x1 = data$running_sum_precip_from_2days_ago_to_week_ago
+x2 = data$`Air temperature 2 m above ground; daily maximum`
+x3 = data$`Relative air humidity 2 m above ground; daily maximum`
+x4 = data$`Reference evaporation from FAO; daily total`
+x5 = data$`Vapour pressure 2 m above ground; daily mean`
+
+X1 = x1; X2=x2;X3=x3;X4=x4;X5=x5;
+x=data.frame(x1, x2,x3,x4, x5);
+
+q=0.9
+
+formula <- as.formula(paste("y~t+", paste("x[,", 1:length(x), "]", collapse = " + ")))
+summary(lm(formula))
+#You have to upload these functions from the main R code file or from the code below in lines 130 - end
+estimate_omega(y, t, x, q)
+#estimate_omega(y, t, x, q, smooth_parameters = TRUE)
+bootstrap(y, t, x, q)
+
+
+estimate_mu(111, y,t,x,q)
+bootstrap_for_mu(111, y,t,x,q)
+
+
+
+
+
+#Main functions
+estimate_omega <- function(y,t,x, q, constant_sigma=FALSE, smooth_parameters = FALSE){ 
+  d = ncol(x) ; if(is.null(d)){d=1}; if(d==1) x = as.numeric(x[,1])
+  
+  #tau estimation
+  if(d==1){  
+    if(smooth_parameters==FALSE){  fit <- rqss(t~x, data = data.frame(x,t), tau =q) }
+    if(smooth_parameters==TRUE){   fit <- rqss(t~qss(x), data = data.frame(x,t), tau =q)}
+  }
+  if(d>1){   
+    if(smooth_parameters==FALSE){formula <- as.formula(paste("t~", paste("x[,", 1:d, "]", collapse = " + ")))}
+    if(smooth_parameters==TRUE){  formula <- as.formula(paste("t~", paste0("qss(X", 1:d, ")", collapse = " + ")))}
+    fit <- rqss(formula, data = data.frame(x,t), tau =q) #fit = rqss(t~x1+x2+x3)
+  }
+  
+  
+  t_excess = c()
+  t_excess_index = c()
+  tau = fitted(fit) #tau is the estimated \hat{\tau}(x_i)
+  for (i in 1:length(y)) {
+    if (t[i]> tau[i] & t[i]>0) {t_excess_index = c(t_excess_index, i); t_excess = c(t_excess, t[i]- tau[i])}
+  } 
+  
+  Y_S = y[t_excess_index]
+  T_S = t[t_excess_index]
+  tau_S = tau[t_excess_index]  
+  
+  # GPD sigma and xi estimation
+  if(d>1 & constant_sigma==FALSE){   
+    A = t_excess
+    B=c()
+    for (i in 1:d) {
+      B = cbind(B, x[t_excess_index, i] )
+    }
+    B = data.frame(B); names(B) = paste0("B", 1:d)
+    
+    if(smooth_parameters==FALSE){formula <- as.formula(paste("A~", paste0("B", 1:d, "", collapse = " + ")))}
+    if(smooth_parameters==TRUE){formula <- as.formula(paste("A~", paste0("s(B", 1:d, ")", collapse = " + ")))}
+    
+    fit2 = evgam( list(formula, ~ 1), data =data.frame(A, B), family="gpd"  )
+    sigma_S = exp(fitted(fit2)[,1])
+  }
+  
+  #Step 2: Final regression
+  
+  if(constant_sigma==TRUE & smooth_parameters == FALSE)   fit3 = gam(Y_S ~ tau_S +tau_S*T_S)
+  if(constant_sigma==TRUE & smooth_parameters == TRUE)    fit3 = gam(Y_S ~ s(tau_S) +s(tau_S, by=T_S))  
+  if(constant_sigma==FALSE & smooth_parameters == FALSE)  fit3 = gam(Y_S ~ tau_S*sigma_S +tau_S*sigma_S*T_S)
+  if(constant_sigma==FALSE & smooth_parameters == TRUE)   fit3 = gam(Y_S ~ s(tau_S, sigma_S) +s(tau_S, sigma_S, by=T_S))
+  
+  result = c()
+  for (i in 1:length(Y_S)) {
+    
+    if(constant_sigma==TRUE & smooth_parameters == FALSE)   { patient_specific_result = fit3$coefficients[3] + fit3$coefficients[4]*tau_S[i] 
+    result = c(result,  patient_specific_result)}
+    if(constant_sigma==FALSE & smooth_parameters == FALSE)   { patient_specific_result = fit3$coefficients[4] + fit3$coefficients[6]*tau_S[i]  +  fit3$coefficients[7]*sigma_S[i] +  fit3$coefficients[8]*tau_S[i]*sigma_S[i]
+    result = c(result,  patient_specific_result)}
+    if(smooth_parameters == TRUE)   {predict_fit = predict(fit3,  type="terms" ,se.fit = FALSE, newdata = data.frame(tau_S = tau_S[i], sigma_S=sigma_S[i], T_S = 1000000000))
+    result = c(result,  predict_fit[2]/1000000000)}
+    
+  }
+  
+  return(    mean(result)       )
+}
+
+
+bootstrap <- function(y,t,x, q=0.9, Bootstrap_size=100, constant_sigma=FALSE, smooth_parameters = FALSE, show_time=TRUE){
+  
+  f <- function(data){ estimate_omega(data$y, data$t, data$x, q = q, constant_sigma, smooth_parameters)[1]  }
+  data = data.frame(y,t,x)
+  
+  result = c()
+  for (i in 1:Bootstrap_size) {
+    z = sample_n(data, size = length(y), replace = TRUE) ;     z$x = z[, -c(1,2)]
+    result = c(result, f(z))
+    if(show_time==TRUE & i%%10 ==0)  cat('Step: ', "\r",Bootstrap_size-i)
+  }
+  result = as.numeric( result ); 
+  
+  result2 = result[abs(result)<median(abs(result)) + 5*quantile(abs(result), 0.75)]
+  
+  data = data.frame(y,t,x); data$x = data[, -c(1,2)]
+  
+  Conf_int_upper = quantile(result2, 0.95);
+  Conf_int_lower = quantile(result2, 0.05);
+  
+  return( data.frame(Lower_conf_int=as.numeric(Conf_int_lower ),Upper_conf_int=as.numeric(Conf_int_upper)))
+  
+}
+
+
+
+
+#Main functions
+estimate_mu <- function(value, y,t,x,q, constant_sigma=FALSE, smooth_parameters = FALSE){ 
+  d = ncol(x) ; if(is.null(d)){d=1}; if(d==1){constant_sigma = TRUE}
+  #tau estimation
+  if(d==1){  
+    if(smooth_parameters==FALSE){  fit <- rqss(t~x, data = data.frame(x,t), tau =q) }
+    if(smooth_parameters==TRUE){   fit <- rqss(t~qss(x), data = data.frame(x,t), tau =q)}
+  }
+  if(d>1){   
+    if(smooth_parameters==FALSE){formula <- as.formula(paste("t~", paste("x[,", 1:d, "]", collapse = " + ")))}
+    if(smooth_parameters==TRUE){  formula <- as.formula(paste("t~", paste0("qss(X", 1:d, ")", collapse = " + ")))}
+    fit <- rqss(formula, data = data.frame(x,t), tau =q) #fit = rqss(t~x1+x2+x3)
+  }
+  
+  
+  t_excess = c()
+  t_excess_index = c()
+  tau = fitted(fit) #tau is the estimated \hat{\tau}(x_i)
+  for (i in 1:length(y)) {
+    if (t[i]> tau[i]) {t_excess_index = c(t_excess_index, i); t_excess = c(t_excess, t[i]- tau[i])}
+  } 
+  
+  Y_S = y[t_excess_index]
+  T_S = t[t_excess_index]
+  tau_S = tau[t_excess_index]  
+  
+  # GPD sigma and xi estimation
+  if(d>1 & constant_sigma==FALSE){   
+    A = t_excess
+    B=c()
+    for (i in 1:d) {
+      B = cbind(B, x[t_excess_index, i] )
+    }
+    B = data.frame(B); names(B) = paste0("B", 1:d)
+    
+    if(smooth_parameters==FALSE){formula <- as.formula(paste("A~", paste0("B", 1:d, "", collapse = " + ")))}
+    if(smooth_parameters==TRUE){formula <- as.formula(paste("A~", paste0("s(B", 1:d, ")", collapse = " + ")))}
+    
+    fit2 = evgam( list(formula, ~ 1), data =data.frame(A, B), family="gpd"  )
+    sigma_S = exp(fitted(fit2)[,1])
+  }
+  
+  #Step 2: Final regression
+  
+  if(constant_sigma==TRUE & smooth_parameters == FALSE)   fit3 = gam(Y_S ~ tau_S +tau_S*T_S)
+  if(constant_sigma==TRUE & smooth_parameters == TRUE)    fit3 = gam(Y_S ~ s(tau_S) +s(tau_S, by=T_S))  
+  if(constant_sigma==FALSE & smooth_parameters == FALSE)  fit3 = gam(Y_S ~ tau_S*sigma_S +tau_S*sigma_S*T_S)
+  if(constant_sigma==FALSE & smooth_parameters == TRUE)   fit3 = gam(Y_S ~ s(tau_S, sigma_S) +s(tau_S, sigma_S, by=T_S))
+  
+  result = c()
+  for (i in 1:length(Y_S)) {
+    
+    if(constant_sigma==TRUE)   { patient_specific_result = predict(fit3, se.fit = FALSE, newdata = data.frame(tau_S = tau_S[i], T_S = value))
+    result = c(result,  patient_specific_result)}
+    if(constant_sigma==FALSE)   { patient_specific_result =predict(fit3, se.fit = FALSE, newdata = data.frame(tau_S = tau_S[i], sigma_S=sigma_S[i], T_S = value))
+    result = c(result,  patient_specific_result)}
+  }
+  
+  return(    mean(result)       )
+}
+
+
+
+
+
+
+
+
+
+bootstrap <- function(y,t,x, q=0.9, Bootstrap_size=100, constant_sigma=FALSE, smooth_parameters = FALSE, show_time=TRUE){
+  
+  f <- function(data){ estimate_omega(data$y, data$t, data$x, q = q, constant_sigma, smooth_parameters)[1]  }
+  data = data.frame(y,t,x)
+  
+  result = c()
+  for (i in 1:Bootstrap_size) {
+    z = sample_n(data, size = length(y), replace = TRUE) ;     z$x = z[, -c(1,2)]
+    result = c(result, f(z))
+    if(show_time==TRUE & i%%10 ==0)  cat('Step: ', "\r",Bootstrap_size-i)
+  }
+  result = as.numeric( result ); 
+  
+  result2 = result[abs(result)<median(abs(result)) + 5*quantile(abs(result), 0.75)]
+  
+  data = data.frame(y,t,x); data$x = data[, -c(1,2)]
+  
+  Conf_int_upper = quantile(result2, 0.95);
+  Conf_int_lower = quantile(result2, 0.05);
+  
+  return( data.frame(Lower_conf_int=as.numeric(Conf_int_lower ),Upper_conf_int=as.numeric(Conf_int_upper)))
+  
+}
+
+
+
+
+
+
+bootstrap_for_mu <- function(value, y,t,x, q=0.9, Bootstrap_size=100, constant_sigma=FALSE, smooth_parameters = FALSE,show_time=TRUE){
+  
+  f <- function(data){ estimate_mu(value, data$y, data$t, data$x, q = q, constant_sigma, smooth_parameters)[1]  }
+  data = data.frame(y,t,x)
+  
+  result = c()
+  for (i in 1:Bootstrap_size) {
+    z = sample_n(data, size = length(y), replace = TRUE) ;     z$x = z[, -c(1,2)]
+    result = c(result, f(z))
+    if(show_time==TRUE & i%%10 ==0)  cat('Step: ', "\r",Bootstrap_size-i)
+  }
+  result = as.numeric( result ); 
+  
+  result2 = result[abs(result)<median(abs(result)) + 5*quantile(abs(result), 0.75)]
+  
+  data = data.frame(y,t,x); data$x = data[, -c(1,2)]
+  
+  Conf_int_upper = quantile(result2, 0.95);
+  Conf_int_lower = quantile(result2, 0.05);
+  
+  return( data.frame(Lower_conf_int=as.numeric(Conf_int_lower ),Upper_conf_int=as.numeric(Conf_int_upper)))
+  
+}
+
+
+
+
+
+
+par(mfrow = c(2,2))
+plot(y~t)
+points(y[t_excess_index]~t[t_excess_index], col = 'blue', lwd = 5)
+
+
+plot(t~x1)
+points(t[t_excess_index]~x1[t_excess_index], col = 'blue', lwd = 5)
+
+
+plot(t~x2)
+points(t[t_excess_index]~x2[t_excess_index], col = 'blue', lwd = 5)
+
+plot(t~x3)
+points(t[t_excess_index]~x3[t_excess_index], col = 'blue', lwd = 5)
+par(mfrow = c(1,1))
+
+

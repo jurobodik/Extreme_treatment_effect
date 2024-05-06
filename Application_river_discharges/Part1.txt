@@ -1,0 +1,139 @@
+# PART1 River discharges application (Known ground truth)
+# First, upload functions estimate_omega and bootstrap from the main R file
+# Data are uploaded from three different files. One file contains discharges, second precipitation and the third one contains other covariates
+# Data upload and cleaning is in lines 1-100. The output is a function read_pair that returns a data.frame of river_discharges and covariates with erased NA data (NA were present only at the beginning or the end of each dataset so no bias is present due to missing values)
+
+
+library(quantreg)
+library(raster)
+library(ambient)
+library(dplyr)
+library(rgl)
+library(evgam)
+library(mgcv)
+library(Pareto)
+library(evmix)
+library(boot)
+library(copula)
+library(MASS)
+library("readxl")
+library(zoo)
+
+
+
+discharges = read.csv(file = 'River_discharges_application/Discharges_summer.csv')
+discharges_info = read.csv(file = 'River_discharges_application/Discharges_info_merged.csv')
+
+precipitation = read.csv(file = 'River_discharges_application/precip.csv')
+precipitation_info = read.csv(file = 'River_discharges_application/precip_info.csv')
+names(precipitation)[1] = 'Date'
+
+
+meteo_stations_data = read.csv(file = 'River_discharges_application/order_118359_data.txt', sep = ';')
+names(meteo_stations_data) = c('Name', 
+                               'Date', 
+                               'Gust peak (one second); daily maximum', 
+                               'Vapour pressure 2 m above ground; daily mean', 
+                               'Air temperature 2 m above ground; daily maximum', 
+                               'Relative air humidity 2 m above ground; daily maximum', 
+                               'Cloud cover; daily mean', 
+                               'Atmospheric pressure at barometric altitude (QFE); daily maximum', 
+                               'Pressure reduced to sea level (QFF); daily maximum', 
+                               'Reference evaporation from FAO; daily total', 
+                               'Sunshine duration; daily total')
+meteo_stations_data$Date = as.Date(as.character(meteo_stations_data$Date), format = "%Y%m%d")
+meteo_stations_data$Month <- as.integer(format(meteo_stations_data$Date, "%m"))
+meteo_stations_data$Year <- lubridate::year(meteo_stations_data$Date)
+
+# Subset dataframe to include only months before year 2015
+meteo_stations_data = subset(meteo_stations_data, Year < 2015)
+meteo_stations_data = subset(meteo_stations_data, Month %in% c(6, 7, 8))
+
+
+
+for (i in 1:nrow(meteo_stations_data)) {
+  for (j in 3:(ncol(meteo_stations_data)-2)) {
+    if(meteo_stations_data[i,j]== "-") meteo_stations_data[i,j]=NA
+  } }
+
+
+read_station <- function(station, meteostation, minimum_number_of_observation=5000){
+  
+  z1=discharges[,c(1,station+1)]; z1$Date = as.Date(z1$Date)
+  z2=precipitation[, c(1, which(names(precipitation) == meteostation)  )]; z2$Date = as.Date(z2$Date)
+  running_max_z2 <- data.frame(rollapply(z2, width = 7, FUN = max, align = "right", fill = NA))
+  running_max_z2[,1] = z2$Date
+  
+  meteo_for_station = meteo_stations_data[meteo_stations_data$Name=='LUZ',]
+  meteo_for_station = meteo_for_station[,colSums(!is.na(meteo_for_station))>minimum_number_of_observation]
+  
+  merged_df <- merge(z1, z2, by = "Date", all = TRUE)
+  merged_df <- merge(merged_df, running_max_z2, by = "Date", all = TRUE)
+  names(merged_df) = c('Date', 'y', 'precip', 'running_max_precip')
+  merged_df <- merge(merged_df, meteo_for_station, by = "Date", all = TRUE)
+  data = subset(na.omit(merged_df), select = -c(Name, Year, Month))
+  
+  for (j in 2:ncol(data)) {data[,j] = as.numeric(data[,j])  } 
+  return(data)
+}
+
+
+
+
+read_pair <- function(station1, station2, meteostation){
+  
+  z1 = read_station(station1, meteostation)[,c(1,2)]
+  z2 = read_station(station2, meteostation)
+  data =  merge(z1, z2, by = "Date", all = TRUE)
+  
+  data = na.omit(data)
+  names(data)[2:3] = c('t', 'y')
+  return(data)
+}
+
+
+
+
+
+
+
+
+
+
+
+
+#Names of the stations are the following:
+#Station1 = 64
+#Station2 = 63
+#Station3 = 42
+#Station4 = 36
+#Station5 = 34
+#M1 = 'MUR'
+#M2 = 'LUZ'
+
+data = read_pair(63, 64, 'MUR')
+
+y = data$y
+t = data$t
+x1=data$precip
+x2=data$running_max_precip
+x3 = data$`Vapour pressure 2 m above ground; daily mean`
+x4 = data$`Air temperature 2 m above ground; daily maximum`
+x5 = data$`Relative air humidity 2 m above ground; daily maximum`
+x6= data$`Pressure reduced to sea level (QFF); daily maximum`
+x7 = data$`Reference evaporation from FAO; daily total`
+
+x=data.frame(x1,x2, x3, x4, x5, x6, x7)
+
+q=0.95
+
+#You have to upload these functions from the main R code file
+estimate_omega(y, t, x, q)
+
+bootstrap(y, t, x, q)
+
+
+
+
+
+

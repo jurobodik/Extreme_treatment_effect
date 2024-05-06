@@ -1,0 +1,1547 @@
+#Kennedy et.al method. Just upload these functions to use them in different simulations
+
+#' @title Estimating average effect curve for continuous treatment
+#'
+#' @description \code{ctseff} is used to estimate the mean outcomes in a population had all subjects received given levels of a continuous (unconfounded) treatment.
+#'
+#' @usage ctseff(y, a, x, bw.seq, sl.lib=c("SL.earth","SL.gam","SL.glm","SL.glmnet",
+#'   "SL.glm.interaction","SL.mean","SL.ranger"))
+#'
+
+#' @param y outcome of interest.
+#' @param a continuous treatment.
+#' @param x covariate matrix.
+#' @param bw.seq sequence of bandwidth values.
+#' @param sl.lib algorithm library for SuperLearner.
+#' Default library includes "earth", "gam", "glm", "glmnet", "glm.interaction",
+#' "mean", and "ranger".
+#'
+#' @return A list containing the following components:
+#' \item{res}{ estimates/SEs/CIs for population means.}
+#' \item{bw.risk}{ estimated risk at sequence of bandwidth values.}
+#'
+#' @examples
+#' n <- 500
+#' x <- matrix(rnorm(n * 5), nrow = n)
+#' a <- runif(n)
+#' y <- a + rnorm(n, sd = .5)
+#'
+#' ce.res <- ctseff(y, a, x, bw.seq = seq(.2, 2, length.out = 100))
+#' plot.ctseff(ce.res)
+#'
+#' # check that bandwidth choice is minimizer
+#' plot(ce.res$bw.risk$bw, ce.res$bw.risk$risk)
+#' @references Kennedy EH, Ma Z, McHugh MD, Small DS (2017). Nonparametric methods for doubly robust estimation of continuous treatment effects. \emph{Journal of the Royal Statistical Society, Series B}. \href{https://arxiv.org/abs/1507.00747}{arxiv:1507.00747}
+#'
+ctseff <- function(y, a, x, bw.seq, n.pts = 100, a.rng = c(min(a), max(a)),
+                   sl.lib = c("SL.earth", "SL.gam", "SL.glm", "SL.glm.interaction", "SL.mean", "SL.ranger")) {
+  require("SuperLearner")
+  require("earth")
+  require("gam")
+  require("ranger")
+  require(KernSmooth)
+  kern <- function(t) {
+    dnorm(t)
+  }
+  
+  n <- dim(x)[1]
+  
+  # set up evaluation points & matrices for predictions
+  a.min <- a.rng[1]
+  a.max <- a.rng[2]
+  a.vals <- seq(a.min, a.max, length.out = n.pts)
+  xa.new <- rbind(cbind(x, a), cbind(x[rep(1:n, length(a.vals)), ], a = rep(a.vals, rep(n, length(a.vals)))))
+  x.new <- xa.new[, -dim(xa.new)[2]]
+  x <- data.frame(x)
+  x.new <- data.frame(x.new)
+  colnames(x) <- colnames(x.new)
+  xa.new <- data.frame(xa.new)
+  
+  # estimate nuisance functions via super learner
+  # note: other methods could be used here instead
+  pimod <- SuperLearner(Y = a, X = data.frame(x), SL.library = sl.lib, newX = x.new)
+  pimod.vals <- pimod$SL.predict
+  pi2mod <- SuperLearner(Y = (a - pimod.vals[1:n])^2, X = x, SL.library = sl.lib, newX = x.new)
+  pi2mod.vals <- pi2mod$SL.predict
+  mumod <- SuperLearner(Y = y, X = cbind(x, a), SL.library = sl.lib, newX = xa.new)
+  muhat.vals <- mumod$SL.predict
+  
+  # construct estimated pi/varpi and mu/m values
+  a.std <- (xa.new$a - pimod.vals) / sqrt(pi2mod.vals)
+  pihat.vals <- approx(density(a.std)$x, density(a.std[1:n])$y, xout = a.std)$y / sqrt(pi2mod.vals)
+  pihat <- pihat.vals[1:n]
+  pihat.mat <- matrix(pihat.vals[-(1:n)], nrow = n, ncol = length(a.vals))
+  varpihat <- predict(smooth.spline(a.vals, apply(pihat.mat, 2, mean)), x = a)$y
+  varpihat.mat <- matrix(rep(apply(pihat.mat, 2, mean), n), byrow = T, nrow = n)
+  muhat <- muhat.vals[1:n]
+  muhat.mat <- matrix(muhat.vals[-(1:n)], nrow = n, ncol = length(a.vals))
+  mhat <- predict(smooth.spline(a.vals, apply(muhat.mat, 2, mean)), x = a)$y
+  mhat.mat <- matrix(rep(apply(muhat.mat, 2, mean), n), byrow = T, nrow = n)
+  
+  
+  # form adjusted/pseudo outcome xi
+  pseudo.out <- (y - muhat) / (pihat / varpihat) + mhat
+  
+  # leave-one-out cross-validation to select bandwidth
+  w.fn <- function(bw) {
+    w.avals <- NULL
+    for (a.val in a.vals) {
+      a.std <- (a - a.val) / bw
+      kern.std <- kern(a.std) / bw
+      w.avals <- c(w.avals, mean(a.std^2 * kern.std) * (kern(0) / bw) /
+                     (mean(kern.std) * mean(a.std^2 * kern.std) - mean(a.std * kern.std)^2))
+    }
+    return(w.avals / n)
+  }
+  hatvals <- function(bw) {
+    approx(a.vals, w.fn(bw), xout = a)$y
+  }
+  cts.eff.fn <- function(out, bw) {
+    approx(locpoly(a, out, bandwidth = bw), xout = a)$y
+  }
+  # note: choice of bandwidth range depends on specific problem,
+  # make sure to inspect plot of risk as function of bandwidth
+  risk.fn <- function(h) {
+    hats <- hatvals(h)
+    mean(((pseudo.out - cts.eff.fn(pseudo.out, bw = h)) / (1 - hats))^2)
+  }
+  risk.est <- sapply(bw.seq, risk.fn)
+  h.opt <- bw.seq[which.min(risk.est)]
+  bw.risk <- data.frame(bw = bw.seq, risk = risk.est)
+  # alternative approach:
+  # h.opt <- optimize(function(h){ hats <- hatvals(h); mean( ((pseudo.out-cts.eff.fn(pseudo.out,bw=h))/(1-hats))^2) } ,
+  #  bw.seq, tol=0.01)$minimum
+  
+  # estimate effect curve with optimal bandwidth
+  est <- approx(locpoly(a, pseudo.out, bandwidth = h.opt), xout = a.vals, rule = 2)$y
+  
+  # estimate pointwise confidence band
+  # note: other methods could also be used
+  se <- NULL
+  for (a.val in a.vals) {
+    a.std <- (a - a.val) / h.opt
+    kern.std <- kern(a.std) / h.opt
+    beta <- coef(lm(pseudo.out ~ a.std, weights = kern.std))
+    Dh <- matrix(c(
+      mean(kern.std), mean(kern.std * a.std),
+      mean(kern.std * a.std), mean(kern.std * a.std^2)
+    ), nrow = 2)
+    kern.mat <- matrix(rep(kern((a.vals - a.val) / h.opt) / h.opt, n), byrow = T, nrow = n)
+    g2 <- matrix(rep((a.vals - a.val) / h.opt, n), byrow = T, nrow = n)
+    intfn1.mat <- kern.mat * (muhat.mat - mhat.mat) * varpihat.mat
+    intfn2.mat <- g2 * kern.mat * (muhat.mat - mhat.mat) * varpihat.mat
+    int1 <- apply(matrix(rep((a.vals[-1]-a.vals[-length(a.vals)]),n),
+                         byrow=T,nrow=n)*(intfn1.mat[,-1] + intfn1.mat[,-length(a.vals)]) / 2, 1,sum)
+    int2 <- apply(matrix(rep((a.vals[-1]-a.vals[-length(a.vals)]),n),
+                         byrow=T,nrow=n)* ( intfn2.mat[,-1] + intfn2.mat[,-length(a.vals)]) /2, 1,sum)
+    sigma <- cov(t(solve(Dh) %*%
+                     rbind(
+                       kern.std * (pseudo.out - beta[1] - beta[2] * a.std) + int1,
+                       a.std * kern.std * (pseudo.out - beta[1] - beta[2] * a.std) + int2
+                     )))
+    se <- c(se, sqrt(sigma[1, 1]))
+  }
+  
+  ci.ll <- est - 1.96 * se / sqrt(n)
+  ci.ul <- est + 1.96 * se / sqrt(n)
+  res <- data.frame(a.vals, est, se, ci.ll, ci.ul)
+  
+  return(invisible(list(res = res, bw.risk = bw.risk)))
+}
+
+
+
+
+
+#' @title Doubly robust estimation of average treatment effect
+#'
+#' @description \code{ate} is used to estimate the mean outcome in a population had
+#'  all subjects received given levels of a discrete (unconfounded) treatment, using
+#'  doubly robust methods with ensembled nuisance estimation.
+#'
+#' @usage ate(y, a, x, nsplits=2, sl.lib=c("SL.earth","SL.gam","SL.glm","SL.glmnet",
+#'   "SL.glm.interaction", "SL.mean","SL.ranger","rpart"))
+#'
+#' @param y outcome of interest.
+#' @param a discrete treatment.
+#' @param x covariate matrix.
+#' @param nsplits integer number of sample splits for nuisance estimation.
+#' If nsplits=1, sample splitting is not used, and nuisance functions are estimated
+#' on full sample (in which case validity of SEs/CIs requires empirical
+#' process conditions). Otherwise must have nsplits>1.
+#' @param sl.lib algorithm library for SuperLearner.
+#' Default library includes "earth", "gam", "glm", "glmnet", "glm.interaction",
+#' "mean", "ranger", "rpart.
+#'
+#' @return A list containing the following components:
+#' \item{res}{ estimates/SEs/CIs/p-values for population means and relevant contrasts.}
+#' \item{nuis}{ subject-specific estimates of nuisance functions (i.e., propensity score and outcome regression) }
+#' \item{ifvals}{ matrix of estimated influence function values.}
+#'
+#' @examples
+#' n <- 100; x <- matrix(rnorm(n*5),nrow=n)
+#' a <- sample(3,n,replace=TRUE); y <- rnorm(n,mean=x[,1])
+#'
+#' ate.res <- ate(y,a,x, sl.lib=c("SL.mean","SL.gam"))
+#'
+#' @references Robins JM, Rotnitzky A (1995). Semiparametric efficiency in multivariate regression models with missing data. \emph{Journal of the American Statistical Association}.
+#' @references Hahn J (1998). On the role of the propensity score in efficient semiparametric estimation of average treatment effects. \emph{Econometrica}.
+#' @references van der Laan MJ, Robins JM (2003). \emph{Unified Methods for Censored Longitudinal Data and Causality} (Springer).
+#' @references Tsiatis AA (2006). \emph{Semiparametric Theory and Missing Data} (Springer).
+#' @references Robins JM, Li L, Tchetgen Tchetgen ET, van der Vaart A (2008). Higher order influence functions and minimax estimation of nonlinear functionals. \emph{Probability and Statistics: Essays in Honor of David A. Freedman}.
+#' @references Zheng W, van der Laan (2010). Asymptotic theory for cross-validated targeted maximum likelihood estimation \emph{UC Berkeley Division of Biostatistics Working Paper Series}.
+#' @references Chernozhukov V, Chetverikov V, Demirer M, et al (2016). Double machine learning for treatment and causal parameters.
+#'
+ate <- function(y,a,x, nsplits=2,
+                sl.lib=c("SL.earth","SL.gam","SL.glm","SL.glm.interaction","SL.mean","SL.ranger","SL.rpart"),
+                ps=NULL){
+  
+  require("SuperLearner")
+  require("earth")
+  require("gam")
+  require("ranger")
+  require("rpart")
+  
+  n <- dim(x)[1]
+  avals <- names(table(a))
+  n.avals <- length(avals)
+  pb <- txtProgressBar(min=0, max=2*nsplits*n.avals, style=3)
+  
+  s <- sample(rep(1:nsplits,ceiling(n/nsplits))[1:n])
+  
+  muhat <- as.data.frame(matrix(NA,nrow=n,ncol=n.avals))
+  colnames(muhat) <- paste("a",avals,sep="")
+  pihat <- muhat
+  
+  pbcount <- 0
+  for (i in 1:n.avals){
+    if (i==1){ Sys.sleep(0.1); setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1 }
+    for (vfold in 1:nsplits){
+      
+      train <- s!=vfold; test <- s==vfold
+      if (nsplits==1){ train <- test }
+      
+      # estimate propensity score
+      if (i != n.avals & is.null(ps)){
+        pifit <- SuperLearner(as.numeric(a==avals[i])[train],as.data.frame(x[train,]),
+                              newX=as.data.frame(x[test,]), SL.library=sl.lib, family=binomial)
+        pihat[test,i] <-pifit$SL.predict }
+      
+      Sys.sleep(0.1)
+      setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+      
+      # estimate regression function
+      mufit <- SuperLearner(y[a==avals[i] & train],
+                            as.data.frame(x[a==avals[i] & train,]),
+                            newX=as.data.frame(x[test,]), SL.library=sl.lib)
+      muhat[test,i] <- mufit$SL.predict
+      
+      Sys.sleep(0.1)
+      setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    }
+    if (i == n.avals){ pihat[,i] <- 1 - apply(pihat,1,sum, na.rm=T) }
+  }
+  
+  amat <- matrix(rep(a,n.avals),nrow=n,byrow=F)
+  alevel <- matrix(rep(as.numeric(avals), rep(n,n.avals)),nrow=n,byrow=F)
+  ymat <- matrix(rep(y,n.avals),nrow=n,byrow=F)
+  
+  if (!is.null(ps)){ pihat <- amat*ps + (1-amat)*(1-ps) }
+  ifvals <- as.matrix( (amat==alevel)*(ymat-muhat)/pihat + muhat )
+  
+  est <- apply(ifvals,2,mean)
+  se <- apply(ifvals,2,sd)/sqrt(n)
+  ci.ll <- est-1.96*se; ci.ul <- est+1.96*se
+  pval <- round(2*(1-pnorm(abs(est/se))),3)
+  paste("E{Y(",avals,")}")
+  res1 <- data.frame(parameter=paste("E{Y(",avals,")}",sep=""), est,se,ci.ll,ci.ul,pval)
+  
+  signdist <- function(x){ c(as.dist(outer(x,x,'-'))) }
+  ifvals2 <- t(apply(ifvals,1,signdist))
+  if (n.avals==2){ ifvals2 <- t(ifvals2)  }
+  
+  tmp <- expand.grid(1:n.avals,1:n.avals)
+  tmp2 <- tmp[tmp[,1]>tmp[,2],]
+  contrasts <- apply(cbind(avals[tmp2[,1]],avals[tmp2[,2]]),1,paste,collapse=")-Y(")
+  contrasts <- paste("E{Y(",contrasts,")}",sep="")
+  
+  est2 <- apply(ifvals2,2,mean)
+  se2 <- apply(ifvals2,2,sd)/sqrt(n)
+  ci.ll2 <- est2-1.96*se2; ci.ul2 <- est2+1.96*se2
+  pval2 <- round(2*(1-pnorm(abs(est2/se2))),3)
+  res2 <- data.frame(parameter=contrasts,est=est2,se=se2,ci.ll=ci.ll2,ci.ul=ci.ul2,pval=pval2)
+  
+  res <- rbind(res1,res2); rownames(res) <- NULL
+  
+  Sys.sleep(0.1)
+  setTxtProgressBar(pb,pbcount)
+  close(pb)
+  
+  nuis <- as.data.frame(cbind(pihat,muhat))
+  colnames(nuis) <- paste(rep(c("pi","mu"), rep(n.avals,2)), colnames(nuis), sep="_")
+  
+  print(res)
+  return(invisible(list(res=res, nuis=nuis, ifvals=as.data.frame(ifvals) )))
+  
+}
+
+
+#' @title Estimating average effect of treatment on the treated
+#'
+#' @description \code{att} is used to estimate the difference in mean outcome among treated subjects had a binary (unconfounded) treatment been withheld.
+#'
+#' @usage att(y, a, x, nsplits=2, sl.lib=c("SL.earth","SL.gam","SL.glm","SL.glmnet",
+#'   "SL.glm.interaction","SL.mean","SL.ranger"))
+#'
+#' @param y outcome of interest.
+#' @param a binary treatment.
+#' @param x covariate matrix.
+#' @param nsplits integer number of sample splits for nuisance estimation.
+#' If nsplits=1, sample splitting is not used, and nuisance functions are estimated
+#' on full sample (in which case validity of SEs/CIs requires empirical
+#' process conditions). Otherwise must have nsplits>1.
+#' @param sl.lib algorithm library if using SuperLearner.
+#' Default library includes "earth", "gam", "glm", "glmnet", "glm.interaction",
+#' "mean", and "ranger".
+#'
+#' @return A list containing the following components:
+#' \item{res}{ estimates/SEs/CIs/p-values for treated means and contrast.}
+#' \item{nuis}{ subject-specific estimates of nuisance functions (i.e., propensity score and outcome regression) }
+#' \item{ifvals}{ vector of estimated influence function values.}
+#'
+#' @examples
+#' n <- 100; x <- matrix(rnorm(n*5),nrow=n)
+#' a <- rbinom(n,1,.3); y <- rnorm(n)
+#'
+#' att.res <- att(y,a,x)
+#'
+#' @references (Also see references for function \code{ate})
+#' @references Kennedy EH, Sjolander A, Small DS (2015). Semiparametric causal inference in matched cohort studies. \emph{Biometrika}.
+#'
+att <- function(y,a,x, nsplits=2,
+                sl.lib=c("SL.earth","SL.gam","SL.glm","SL.glm.interaction","SL.mean",
+                         "SL.ranger")){
+  
+  require("SuperLearner")
+  require("earth")
+  require("gam")
+  require("ranger")
+  require("rpart")
+  
+  n <- dim(x)[1]
+  pb <- txtProgressBar(min=0, max=2*nsplits, style=3)
+  
+  s <- sample(rep(1:nsplits,ceiling(n/nsplits))[1:n])
+  pihat <- rep(NA,n); mu0hat <- rep(NA,n)
+  
+  pbcount <- 0
+  Sys.sleep(0.1); setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+  for (vfold in 1:nsplits){
+    
+    train <- s!=vfold; test <- s==vfold
+    if (nsplits==1){ train <- test }
+    
+    # estimate propensity score
+    pifit <- SuperLearner(a[train],as.data.frame(x[train,]),
+                          newX=as.data.frame(x[test,]), SL.library=sl.lib, family=binomial)
+    pihat[test] <- pifit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    
+    # estimate regression function
+    mu0fit <- SuperLearner(y[a==0 & train],
+                           as.data.frame(x[a==0 & train,]),
+                           newX=as.data.frame(x[test,]), SL.library=sl.lib)
+    mu0hat[test] <- mu0fit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+  }
+  
+  ey01hat <- mean((a/mean(a))*mu0hat + ((1-a)/mean(1-a))*(y-mu0hat)*pihat/(1-pihat))
+  psihat <- mean((a/mean(a))*(y-mu0hat) - ((1-a)/mean(1-a))*(y-mu0hat)*pihat/(1-pihat))
+  
+  ifvals <- cbind( a*(y-mean(y))/mean(a),
+                   (a/mean(a))*(mu0hat - ey01hat) + ((1-a)/mean(1-a))*(y-mu0hat)*pihat/(1-pihat),
+                   (a/mean(a))*(y-mu0hat - psihat) - ((1-a)/mean(1-a))*(y-mu0hat)*pihat/(1-pihat) )
+  
+  est <- c(mean(y[a==1]), ey01hat, psihat)
+  se <- apply(ifvals,2,sd)/sqrt(n)
+  ci.ll <- est-1.96*se; ci.ul <- est+1.96*se
+  pval <- round(2*(1-pnorm(abs(est/se))),3)
+  param <- c("E(Y|A=1)","E{Y(0)|A=1}", "E{Y-Y(0)|A=1}")
+  res <- data.frame(parameter=param, est,se,ci.ll,ci.ul,pval)
+  rownames(res) <- NULL
+  
+  Sys.sleep(0.1)
+  setTxtProgressBar(pb,pbcount)
+  close(pb)
+  
+  nuis <- data.frame(pi=pihat,mu0=mu0hat)
+  
+  print(res)
+  return(invisible(list(res=res, nuis=nuis, ifvals=as.data.frame(ifvals) )))
+  
+}
+
+
+#' @title Doubly robust series estimation of counterfactual densities
+#'
+#' @description \code{cdensity} is used to estimate counterfactual densities,
+#'  i.e., the density of the potential outcome in a population if everyone
+#'  received given treatment levels, using doubly robust estimates of L2
+#'  projections of the density onto a linear basis expansion. Nuisance functions
+#'  are estimated with random forests. The L2 distance between the density of the
+#'  counterfactuals is also estimated as a density-based treatment effect.
+#'
+#' @usage cdensity(y, a, x, kmax=5, l2 = TRUE,
+#'  gridlen=20, nsplits=2, progress_updates = TRUE,
+#'  makeplot=TRUE, kforplot=5, ylim=NULL)
+#'
+#' @param y outcome of interest.
+#' @param a binary treatment (more than 2 levels are allowed, but only densities under
+#'  A=1 and A=0 will be estimated).
+#' @param x covariate matrix.
+#' @param kmax Integer indicating maximum dimension of (cosine) basis
+#'  expansion that should be used in series estimator.
+#' @param l2 A \code{logical} value indicating whether an estimate of the L2 distance
+#'  between counterfactual densities (under A=1 vs A=0) should be returned.
+#' @param gridlen Integer number indicating length of grid for which the
+#'  plug-in estimator of the marginal density is computed.
+#' @param nsplits Integer number of sample splits for nuisance estimation. If
+#'  \code{nsplits = 1}, sample splitting is not used, and nuisance functions are
+#'  estimated n full sample (in which case validity of standard errors and
+#'  confidence intervals requires empirical process conditions). Otherwise must
+#'  have \code{nsplits > 1}.
+#' @param progress_updates A \code{logical} value indicating whether to print a
+#'  progress statement as various stages of computation reach completion.
+#'  The default is \code{TRUE}, printing a progress bar to inform the user.
+#' @param makeplot A \code{logical} value indicating whether to print a plot.
+#' @param kforplot A vector of two integers indicating which k values to plot results for,
+#'  with first argument for A=1 and second for A=0.
+#' @param ylim Range of y values at which density should be plotted.
+#'
+#' @return A list containing the following components:
+#' \item{res}{ estimates/SEs/CIs/p-values for population means and relevant contrasts.}
+#' \item{nuis}{ subject-specific estimates of nuisance functions (i.e., propensity score and outcome regression) }
+#' \item{ifvals}{ matrix of estimated influence function values.}
+#'
+#' @importFrom stats qnorm as.formula
+#' @importFrom ranger ranger
+#'
+#' @export
+#'
+#' @examples
+#' n <- 100; x <- matrix(rnorm(n*5),nrow=n)
+#' a <- sample(3,n,replace=TRUE)-2; y <- rnorm(n)
+#'
+#' cdens.res <- cdensity(y,a,x)
+#'
+#' @references Kennedy EH, Wasserman LA, Balakrishnan S. Semiparametric counterfactual
+#' density estimation. \href{https://arxiv.org/abs/TBA}{arxiv:TBA}
+#
+
+cdensity <- function(y, a, x,
+                     kmax=5, l2=TRUE,
+                     gridlen=20, nsplits=2, progress_updates = TRUE,
+                     makeplot=TRUE, kforplot=c(5,5), ylim=NULL) {
+  
+  require("ranger")
+  pos.part <- function(x){ x*(x>0)+0*(x<0) }
+  
+  ### preliminaries
+  
+  # rescale outcome in [0,1]
+  n <- length(y)
+  ymax <- max(y,na.rm=T); ymin <- min(y,na.rm=T)
+  yorig <- y; y <- (yorig-ymin)/(ymax-ymin)
+  # set treatment indicators
+  a1 <- as.numeric(a==1); a0 <- as.numeric(a==0)
+  if (sum(a1==0 & a0==0)>0){ y[a1==0 & a0==0] <- 0 }
+  # set grid for plugin estimator
+  ygrid <- quantile(y[a1==1 | a0==1],probs=seq(0,1,length.out=gridlen))
+  
+  # create splits & put into superlearner form
+  v <- nsplits
+  s <- sample(rep(1:v, ceiling(n/v))[1:n])
+  splits <- vector(mode="list", length=v); names(splits) <- 1:v
+  for (i in 1:v){ splits[[i]] <- (1:n)[s==i] }
+  
+  # initialize storage vectors
+  pi1hat <- rep(NA,n); pi0hat <- rep(NA,n)
+  mu1mat <- matrix(nrow=n,ncol=kmax)
+  mu0mat <- matrix(nrow=n,ncol=kmax)
+  eta1mat <- matrix(nrow=n,ncol=gridlen)
+  eta0mat <- matrix(nrow=n,ncol=gridlen)
+  p1hat <- rep(NA,gridlen); p0hat <- rep(NA,gridlen)
+  p1yrega1hat <- rep(NA,n); p0yrega1hat <- rep(NA,n)
+  p1yrega0hat <- rep(NA,n); p0yrega0hat <- rep(NA,n)
+  
+  # create basis functions & compute at obs y vals
+  #bfun <- function(t,k){ (k%%2 == 1) *sqrt(2)*cos(2*ceiling(k/2)*pi*t) + (k%%2 == 0) *sqrt(2)*sin(2*ceiling(k/2)*pi*t) }
+  bfun <- function(t,k){ sqrt(2)*cos(k*pi*t) }
+  b <- Vectorize(bfun,vectorize.args="k")
+  bmat <- NULL; for (k in 1:kmax){ bmat <- cbind(bmat, b(y,k)) }
+  
+  # loop through folds
+  for (test in 1:v){
+    if (progress_updates==T){ print(paste("fold:",test)); flush.console() }
+    
+    ### estimate nuisance functions
+    
+    # estimate propensity scores
+    if (progress_updates==T){ print("    estimating propensity scores..."); flush.console() }
+    pi1mod <- ranger(a1[s!=test] ~ ., data=data.frame(x[s!=test,]))
+    pi0mod <- ranger(a0[s!=test] ~ ., data=data.frame(x[s!=test,]))
+    pi1hat[s==test] <- predict(pi1mod, data=data.frame(x[s==test,]))$predictions
+    pi0hat[s==test] <- predict(pi0mod, data=data.frame(x[s==test,]))$predictions
+    
+    # estimate basis-transformed outcome regressions
+    if (progress_updates==T){ print("    estimating outcome regressions..."); flush.console() }
+    for (i in 1:kmax){
+      mu1mod <- ranger(bmat[a1==1 & s!=test,i] ~ ., data=data.frame(x[a1==1 & s!=test,]))
+      mu0mod <- ranger(bmat[a0==1 & s!=test,i] ~ ., data=data.frame(x[a0==1 & s!=test,]))
+      mu1mat[s==test,i] <- predict(mu1mod, data=data.frame(x[s==test,]))$predictions
+      mu0mat[s==test,i] <- predict(mu0mod, data=data.frame(x[s==test,]))$predictions
+    }
+    
+    # estimate conditional density
+    if (progress_updates==T){ print("    estimating conditional densities..."); flush.console() }
+    for (j in 1:gridlen){
+      # regress kernel outcome w/silverman's rule on x w/ranger
+      h <- bw.nrd0(y[a1==1 | a0==1])
+      kern <- dnorm((y-ygrid[j])/h)/h
+      eta1mod <- ranger(kern[a1==1 & s!=test] ~ ., data=data.frame(x[a1==1 & s!=test,]))
+      eta0mod <- ranger(kern[a0==1 & s!=test] ~ ., data=data.frame(x[a0==1 & s!=test,]))
+      eta1mat[s==test,j] <- predict(eta1mod, data=data.frame(x[s==test,]))$predictions
+      eta0mat[s==test,j] <- predict(eta0mod, data=data.frame(x[s==test,]))$predictions
+      # marginalize in training data for density regressions
+      p1hat[j] <- mean(predict(eta1mod, data=data.frame(x[s!=test,]))$predictions)
+      p0hat[j] <- mean(predict(eta0mod, data=data.frame(x[s!=test,]))$predictions)
+    }
+    
+    # estimate regressions of p1y,p0y on x
+    if (progress_updates==T){ print("    estimating density regressions..."); flush.console() }
+    p1y.trn <- approx(ygrid,p1hat,xout=y,rule=2)$y
+    p0y.trn <- approx(ygrid,p0hat,xout=y,rule=2)$y
+    p1ymod1 <- ranger(p1y.trn[a1==1 & s!=test] ~ ., data=data.frame(x[a1==1 & s!=test,]))
+    p0ymod1 <- ranger(p0y.trn[a1==1 & s!=test] ~ ., data=data.frame(x[a1==1 & s!=test,]))
+    p1ymod0 <- ranger(p1y.trn[a0==1 & s!=test] ~ ., data=data.frame(x[a0==1 & s!=test,]))
+    p0ymod0 <- ranger(p0y.trn[a0==1 & s!=test] ~ ., data=data.frame(x[a0==1 & s!=test,]))
+    p1yrega1hat[s==test] <- predict(p1ymod1, data=data.frame(x[s==test,]))$predictions
+    p0yrega1hat[s==test] <- predict(p0ymod1, data=data.frame(x[s==test,]))$predictions
+    p1yrega0hat[s==test] <- predict(p1ymod0, data=data.frame(x[s==test,]))$predictions
+    p0yrega0hat[s==test] <- predict(p0ymod0, data=data.frame(x[s==test,]))$predictions
+    
+  }
+  
+  ### plug-in estimator
+  
+  p1hatvals <- apply(eta1mat,2,mean)
+  p0hatvals <- apply(eta0mat,2,mean)
+  p1hatfn <- function(t){ approx(ygrid,p1hatvals,xout=t,rule=2)$y }
+  p0hatfn <- function(t){ approx(ygrid,p0hatvals,xout=t,rule=2)$y }
+  p1hat.const <- integrate(p1hatfn, lower=0,upper=1)$val
+  p0hat.const <- integrate(p0hatfn, lower=0,upper=1)$val
+  p1hat <- function(t){ approx(ygrid,p1hatvals,xout=t,rule=2)$y/p1hat.const }
+  p0hat <- function(t){ approx(ygrid,p0hatvals,xout=t,rule=2)$y/p0hat.const }
+  
+  ###  l2 projection
+  
+  drmean1 <- apply((a1/pi1hat)*(bmat-mu1mat) + mu1mat,2,mean)
+  drmean0 <- apply((a0/pi0hat)*(bmat-mu0mat) + mu0mat,2,mean)
+  g1fun <- function(k,t){ pos.part(1 + b(t,1:k) %*% drmean1[1:k]) }
+  g0fun <- function(k,t){ pos.part(1 + b(t,1:k) %*% drmean0[1:k]) }
+  g1kconst <- function(k){ integrate(function(t){ g1fun(k,t) },lower=0,upper=1)$val }
+  g0kconst <- function(k){ integrate(function(t){ g0fun(k,t) },lower=0,upper=1)$val }
+  g1 <- function(k,t){ g1fun(k,t) / g1kconst(k) }
+  g0 <- function(k,t){ g0fun(k,t) / g0kconst(k) }
+  
+  ### L2 distance
+  
+  if (l2==TRUE){
+    l2.plugin <- integrate( function(t){ (p1hat(t)-p0hat(t))^2 }, lower=0,upper=1)$value
+    
+    p1yhat <- p1hat(y); p0yhat <- p0hat(y)
+    psif.if <- 2 * ( (a1/pi1hat)*((p1yhat-p0yhat) - (p1yrega1hat-p0yrega1hat)) + (p1yrega1hat-p0yrega1hat) -
+                       ( (a0/pi0hat)*((p1yhat-p0yhat) - (p1yrega0hat-p0yrega0hat)) + (p1yrega0hat-p0yrega0hat) ) - l2.plugin)
+    
+    est <- l2.plugin + mean(psif.if)
+    se <- sqrt(var(psif.if)/n)
+    ci.ll <- est - 1.96*se; ci.ul <- est + 1.96*se
+    
+    ### results
+    
+    res <- data.frame(parameter="L2 distance", est,se,ci.ll,ci.ul) }
+  
+  ifvals <- list(a1 = (a1/pi1hat)*(bmat-mu1mat) + mu1mat, a0= (a0/pi0hat)*(bmat-mu0mat) + mu0mat)
+  
+  if (makeplot==T){
+    se1 <- function(k,t){ sqrt(diag( b(t,1:k) %*% cov(ifvals$a1)[1:k,1:k] %*% t(b(t,1:k)) )/n) }
+    se0 <- function(k,t){ sqrt(diag( b(t,1:k) %*% cov(ifvals$a0)[1:k,1:k] %*% t(b(t,1:k)) )/n) }
+    
+    par(mfrow=c(1,1))
+    if (is.null(ylim)){ yrng <- c(0,1) }
+    if (!is.null(ylim)){ yrng <- (ylim-ymin)/(ymax-ymin) }
+    yseq <- seq(yrng[1],yrng[2],length.out=250)*(ymax-ymin)+ymin
+    g1est <- g1(kforplot[1],(yseq-ymin)/(ymax-ymin))/(ymax-ymin); g0est <- g0(kforplot[2],(yseq-ymin)/(ymax-ymin))/(ymax-ymin)
+    se1est <- se1(kforplot[1],(yseq-ymin)/(ymax-ymin))/(ymax-ymin); se0est <- se0(kforplot[2],(yseq-ymin)/(ymax-ymin))/(ymax-ymin)
+    
+    plot(yseq, g1est, type="l", lwd=2,col="darkblue",
+         xlab="y",ylab="Estimate", main="Counterfactual density (& pointwise CI)",
+         ylim=range(c(0,g0est+1.96*se0est,g1est+1.96*se1est)))
+    polygon(c(yseq, rev(yseq)), c(g0est-1.96*se0est, rev(g0est+1.96*se0est)), col="lightsalmon",border=NA)
+    polygon(c(yseq, rev(yseq)), c(g1est-1.96*se1est, rev(g1est+1.96*se1est)), col="lightblue3",border=NA)
+    lines(yseq, g1est, lwd=2,col="darkblue")
+    lines(yseq, g0est, lwd=2,col="darkred",lty=2)
+    lgd <- legend("topright",legend=c(expression(Y^1),expression(Y^0)),lwd=2,lty=1:2,col=c("darkblue","darkred"),bg="transparent")
+    points(rep((lgd$rect$left + lgd$text$x[1])/2,2), lgd$text$y, pch=15,cex=2.25,col=c("lightblue3","lightsalmon"))
+    lgd <- legend("topright",legend=c(expression(Y^1),expression(Y^0)),lwd=2,lty=1:2,col=c("darkblue","darkred"),bg="transparent")
+  }
+  
+  if (l2==T){ print(res) } else { res <- NULL }
+  return(invisible(list(res=res, g1=g1, g0=g0, ifvals=ifvals)))
+  
+}
+
+#' @title Cross-validation for doubly robust estimation of counterfactual densities
+#'
+#' @description \code{cv.cdensity} estimates counterfactual densities using
+#'  linear cosine basis expansions at a sequence of dimensions, and then estimates
+#'  the L2 pseudo-risk of each, which can be used for purposes of model selection.
+#'  Nuisance functions are estimated with random forests.
+#'
+#' @usage cv.cdensity(y, a, x, kmax=5,
+#'  gridlen=20, nsplits=2, progress_updates = TRUE)
+#'
+#' @param y outcome of interest.
+#' @param a binary treatment (more than 2 levels are allowed, but only densities under
+#'  A=1 and A=0 will be estimated).
+#' @param x covariate matrix.
+#' @param kmax Integer indicating maximum dimension of (cosine) basis
+#'  expansion that should be used in series estimator.
+#' @param gridlen Integer number indicating length of grid for which the
+#'  plug-in estimator of the marginal density is computed.
+#' @param nsplits Integer number of sample splits for nuisance estimation. If
+#'  \code{nsplits = 1}, sample splitting is not used, and nuisance functions are
+#'  estimated n full sample (in which case validity of standard errors and
+#'  confidence intervals requires empirical process conditions). Otherwise must
+#'  have \code{nsplits > 1}.
+#' @param progress_updates A \code{logical} value indicating whether to print a
+#'  progress statement as various stages of computation reach completion.
+#'  The default is \code{TRUE}, printing a progress bar to inform the user.
+#'
+#' @return A plot of the pseudo L2 risk of candidate estimators for counterfactual
+#'  densities, at each model dimension from 1 to kmax
+#'
+#' @importFrom stats qnorm as.formula
+#' @importFrom ranger ranger
+#'
+#' @export
+#'
+#' @examples
+#' n <- 100; x <- matrix(rnorm(n*5),nrow=n)
+#' a <- sample(3,n,replace=TRUE)-2; y <- rnorm(n)
+#'
+#' cv.cdensity(y,a,x)
+#'
+#' @references Kennedy EH, Wasserman LA, Balakrishnan S. Semiparametric counterfactual
+#' density estimation. \href{https://arxiv.org/abs/TBA}{arxiv:TBA}
+#
+cv.cdensity <- function(y, a, x,
+                        kmax=5, gridlen=20, nsplits=2,
+                        progress_updates = TRUE) {
+  
+  require("ranger")
+  pos.part <- function(x){ x*(x>0)+0*(x<0) }
+  
+  ### preliminaries
+  
+  # rescale outcome in [0,1]
+  n <- length(y)
+  ymax <- max(y,na.rm=T); ymin <- min(y,na.rm=T)
+  yorig <- y; y <- (yorig-ymin)/(ymax-ymin)
+  # set treatment indicators
+  a1 <- as.numeric(a==1); a0 <- as.numeric(a==0)
+  if (sum(a1==0 & a0==0)>0){ y[a1==0 & a0==0] <- 0 }
+  dat.all <- data.frame(y,a1,a0,x)
+  
+  # set grid for plugin estimator
+  ygrid <- quantile(y[a1==1 | a0==1],probs=seq(0,1,length.out=gridlen))
+  
+  # select half for learning g / model selection
+  train <- sample( rep(0:1,ceiling(n/2))[1:n] )
+  
+  for (set in 1:0){
+    
+    if (set==1 & progress_updates==T){ print("estimating candidate densities"); flush.console() }
+    if (set==0 & progress_updates==T){ print("starting model selection"); flush.console() }
+    
+    # setup test data
+    n <- sum(train==set); x <- dat.all[train==set,-(1:3)]
+    y <- dat.all$y[train==set]; a1 <- dat.all$a1[train==set]; a0 <- dat.all$a0[train==set]
+    
+    # create splits & put into superlearner form
+    v <- nsplits
+    s <- sample(rep(1:v, ceiling(n/v))[1:n])
+    splits <- vector(mode="list", length=v); names(splits) <- 1:v
+    for (i in 1:v){ splits[[i]] <- (1:n)[s==i] }
+    
+    # initialize storage vectors
+    pi1hat <- rep(NA,n); pi0hat <- rep(NA,n)
+    mu1mat <- matrix(nrow=n,ncol=kmax)
+    mu0mat <- matrix(nrow=n,ncol=kmax)
+    eta1mat <- matrix(nrow=n,ncol=gridlen)
+    eta0mat <- matrix(nrow=n,ncol=gridlen)
+    p1hat <- rep(NA,gridlen); p0hat <- rep(NA,gridlen)
+    p1yrega1hat <- rep(NA,n); p0yrega1hat <- rep(NA,n)
+    p1yrega0hat <- rep(NA,n); p0yrega0hat <- rep(NA,n)
+    
+    # create basis functions & compute at obs y vals
+    #bfun <- function(t,k){ (k%%2 == 1) *sqrt(2)*cos(2*ceiling(k/2)*pi*t) + (k%%2 == 0) *sqrt(2)*sin(2*ceiling(k/2)*pi*t) }
+    bfun <- function(t,k){ sqrt(2)*cos(k*pi*t) }
+    b <- Vectorize(bfun,vectorize.args="k")
+    bmat <- NULL; for (k in 1:kmax){ bmat <- cbind(bmat, b(y,k)) }
+    
+    # loop through folds
+    for (test in 1:v){
+      if (progress_updates==T){ print(paste("fold:",test)); flush.console() }
+      
+      ### estimate nuisance functions
+      
+      # estimate propensity scores
+      if (progress_updates==T){ print("    estimating propensity scores..."); flush.console() }
+      pi1mod <- ranger(a1[s!=test] ~ ., data=data.frame(x[s!=test,]))
+      pi0mod <- ranger(a0[s!=test] ~ ., data=data.frame(x[s!=test,]))
+      pi1hat[s==test] <- predict(pi1mod, data=data.frame(x[s==test,]))$predictions
+      pi0hat[s==test] <- predict(pi0mod, data=data.frame(x[s==test,]))$predictions
+      
+      # estimate basis-transformed outcome regressions
+      if (progress_updates==T){ print("    estimating outcome regressions..."); flush.console() }
+      for (i in 1:kmax){
+        mu1mod <- ranger(bmat[a1==1 & s!=test,i] ~ ., data=data.frame(x[a1==1 & s!=test,]))
+        mu0mod <- ranger(bmat[a0==1 & s!=test,i] ~ ., data=data.frame(x[a0==1 & s!=test,]))
+        mu1mat[s==test,i] <- predict(mu1mod, data=data.frame(x[s==test,]))$predictions
+        mu0mat[s==test,i] <- predict(mu0mod, data=data.frame(x[s==test,]))$predictions
+      }
+      
+      # estimate conditional density
+      if (progress_updates==T){ print("    estimating conditional densities..."); flush.console() }
+      for (j in 1:gridlen){
+        # regress kernel outcome w/silverman's rule on x w/ranger
+        h <- bw.nrd0(y[a1==1 | a0==1])
+        kern <- dnorm((y-ygrid[j])/h)/h
+        eta1mod <- ranger(kern[a1==1 & s!=test] ~ ., data=data.frame(x[a1==1 & s!=test,]))
+        eta0mod <- ranger(kern[a0==1 & s!=test] ~ ., data=data.frame(x[a0==1 & s!=test,]))
+        eta1mat[s==test,j] <- predict(eta1mod, data=data.frame(x[s==test,]))$predictions
+        eta0mat[s==test,j] <- predict(eta0mod, data=data.frame(x[s==test,]))$predictions
+        # marginalize in training data for density regressions
+        p1hat[j] <- mean(predict(eta1mod, data=data.frame(x[s!=test,]))$predictions)
+        p0hat[j] <- mean(predict(eta0mod, data=data.frame(x[s!=test,]))$predictions)
+      }
+      
+      # estimate regressions of p1y,p0y on x
+      if (progress_updates==T){ print("    estimating density regressions..."); flush.console() }
+      p1y.trn <- approx(ygrid,p1hat,xout=y,rule=2)$y
+      p0y.trn <- approx(ygrid,p0hat,xout=y,rule=2)$y
+      p1ymod1 <- ranger(p1y.trn[a1==1 & s!=test] ~ ., data=data.frame(x[a1==1 & s!=test,]))
+      p0ymod1 <- ranger(p0y.trn[a1==1 & s!=test] ~ ., data=data.frame(x[a1==1 & s!=test,]))
+      p1ymod0 <- ranger(p1y.trn[a0==1 & s!=test] ~ ., data=data.frame(x[a0==1 & s!=test,]))
+      p0ymod0 <- ranger(p0y.trn[a0==1 & s!=test] ~ ., data=data.frame(x[a0==1 & s!=test,]))
+      p1yrega1hat[s==test] <- predict(p1ymod1, data=data.frame(x[s==test,]))$predictions
+      p0yrega1hat[s==test] <- predict(p0ymod1, data=data.frame(x[s==test,]))$predictions
+      p1yrega0hat[s==test] <- predict(p1ymod0, data=data.frame(x[s==test,]))$predictions
+      p0yrega0hat[s==test] <- predict(p0ymod0, data=data.frame(x[s==test,]))$predictions
+      
+    }
+    
+    ### plug-in estimator
+    
+    p1hatvals <- apply(eta1mat,2,mean)
+    p0hatvals <- apply(eta0mat,2,mean)
+    p1hatfn <- function(t){ approx(ygrid,p1hatvals,xout=t,rule=2)$y }
+    p0hatfn <- function(t){ approx(ygrid,p0hatvals,xout=t,rule=2)$y }
+    p1hat.const <- integrate(p1hatfn, lower=0,upper=1)$val
+    p0hat.const <- integrate(p0hatfn, lower=0,upper=1)$val
+    p1hat <- function(t){ approx(ygrid,p1hatvals,xout=t,rule=2)$y/p1hat.const }
+    p0hat <- function(t){ approx(ygrid,p0hatvals,xout=t,rule=2)$y/p0hat.const }
+    
+    ###  l2 projection
+    
+    if (set==1){
+      betag1 <- apply((a1/pi1hat)*(bmat-mu1mat) + mu1mat,2,mean)
+      betag0 <- apply((a0/pi0hat)*(bmat-mu0mat) + mu0mat,2,mean)
+      g1fun <- function(k,t){ pos.part(1 + b(t,1:k) %*% betag1[1:k]) }
+      g0fun <- function(k,t){ pos.part(1 + b(t,1:k) %*% betag0[1:k]) }
+      g1kconst <- function(k){ integrate(function(t){ g1fun(k,t) },lower=0,upper=1)$val }
+      g0kconst <- function(k){ integrate(function(t){ g0fun(k,t) },lower=0,upper=1)$val }
+      g1 <- function(k,t){ g1fun(k,t) / g1kconst(k) }
+      g0 <- function(k,t){ g0fun(k,t) / g0kconst(k) }
+    }
+    
+  }
+  
+  ### estimate and plot pseudo L2 risk
+  
+  par(mfrow=c(1,2))
+  
+  for (trt in 1:0){
+    
+    if (trt==1){
+      g <- g1; phat <- p1hat; mumat <- mu1mat; drmean <- apply((a1/pi1hat)*(bmat-mu1mat) + mu1mat,2,mean)
+      aval <- a1; pihat <- pi1hat; title <- expression(Y^1," density") }
+    if (trt==0){
+      g <- g0; phat <- p0hat; mumat <- mu0mat; drmean <- apply((a0/pi0hat)*(bmat-mu0mat) + mu0mat,2,mean)
+      aval <- a0; pihat <- pi0hat; title <- expression(Y^0," density") }
+    
+    # plugin
+    delta.plugin <- rep(NA,kmax)
+    for (j in 1:kmax){
+      delta.plugin[j] <- integrate(function(t){ (g(j,t)-phat(t))^2 },lower=0,upper=1)$val }
+    
+    meth <- "shifted"
+    
+    # one-step estimator of L2
+    if (meth=="L2"){
+      delta.res <- data.frame(matrix(nrow=kmax,ncol=3))
+      colnames(delta.res) <- c("est","ci.ll","ci.ul")
+      for (j in 1:kmax){
+        pyhat <- phat(y); gy <- g(j,y)
+        gyregahat <- 1 + mumat %*% c(drmean[1:j],rep(0,kmax-j))
+        delta.ifmean <- integrate(function(t){ (phat(t)-g(j,t))*phat(t) },lower=0,upper=1)$val
+        delta.if <- 2 * ( (aval/pihat)*((pyhat-gy) - (pyregahat-gyregahat)) +
+                            (pyregahat-gyregahat) - delta.ifmean )
+        delta.res$est[j] <- delta.plugin[j] + mean(delta.if)
+        delta.res$ci.ll[j] <- delta.res$est[j] - 1.96*sqrt(var(delta.if)/n)
+        delta.res$ci.ul[j] <- delta.res$est[j] + 1.96*sqrt(var(delta.if)/n)
+      } }
+    
+    # shifted/pseudo L2
+    if (meth=="shifted"){
+      delta.res <- data.frame(matrix(nrow=kmax,ncol=3))
+      colnames(delta.res) <- c("est","ci.ll","ci.ul")
+      for (j in 1:kmax){
+        gy <- g(j,y); gyregahat <- 1 + mumat %*% c(drmean[1:j],rep(0,kmax-j))
+        gnorm <- integrate(function(t){ g(j,t)^2 },lower=0,upper=1)$val
+        delta.if <- 2*( (aval/pihat)*(gy - gyregahat) + gyregahat )
+        delta.res$est[j] <- gnorm - mean(delta.if)
+        delta.res$ci.ll[j] <- delta.res$est[j] - 1.96*sqrt(var(delta.if)/n)
+        delta.res$ci.ul[j] <- delta.res$est[j] + 1.96*sqrt(var(delta.if)/n)
+      } }
+    
+    kseq <- 1:kmax
+    plot(kseq,delta.res$est, ylim=range(delta.res),pch="",
+         ylab="Pseudo L2 risk", xlab="Basis dimension",
+         main=title)
+    segments(kseq,delta.res$ci.ll,kseq,delta.res$ci.ul, col="lightgray")
+    lines(kseq,delta.res$est); points(kseq,delta.res$est)
+    
+  }
+  
+  ### results
+  
+  
+}
+
+
+#' @title Estimating effects of incremental propensity score interventions
+#'
+#' @description \code{ipsi} is used to estimate effects of incremental
+#'  propensity score interventions, i.e., estimates of mean outcomes if the odds
+#'  of receiving treatment were multiplied by a factor delta.
+#'
+#' @usage ipsi(y, a, x.trt, x.out, time, id, delta.seq, nsplits, ci_level = 0.95,
+#'  progress_bar = TRUE, return_ifvals = FALSE, fit,
+#'  sl.lib=c("SL.earth","SL.gam","SL.glm","SL.glmnet","SL.glm.interaction", "SL.mean","SL.ranger","rpart"))
+#'
+#' @param y Outcome of interest measured at end of study.
+#' @param a Binary treatment.
+#' @param x.trt Covariate matrix for treatment regression.
+#' @param x.out Covariate matrix for outcome regression.
+#' @param time Measurement time.
+#' @param id Subject identifier.
+#' @param delta.seq Sequence of delta increment values for incremental
+#'  propensity score intervention.
+#' @param nsplits Integer number of sample splits for nuisance estimation. If
+#'  \code{nsplits = 1}, sample splitting is not used, and nuisance functions are
+#'  estimated n full sample (in which case validity of standard errors and
+#'  confidence intervals requires empirical process conditions). Otherwise must
+#'  have \code{nsplits > 1}.
+#' @param ci_level A \code{numeric} value giving the level (1 - alpha) of the
+#'  confidence interval to be computed around the point estimate.
+#' @param progress_bar A \code{logical} value indicating whether to print a
+#'  customized progress bar as various stages of computation reach completion.
+#'  The default is \code{TRUE}, printing a progress bar to inform the user.
+#' @param return_ifvals A \code{logical} indicating whether the estimated
+#'  observation-level values of the influence function ought to be returned as
+#'  part of the output object. The default is \code{FALSE} as these values are
+#'  rarely of interest in standard usage.
+#' @param fit How nuisance functions should be estimated. Options are "rf" for
+#'  random forests via the \code{ranger} package, or "sl" for super learner.
+#' @param sl.lib sl.lib algorithm library for SuperLearner.
+#' Default library includes "earth", "gam", "glm", "glmnet", "glm.interaction",
+#' "mean", "ranger", "rpart.
+#'
+#' @section Details:
+#' Treatment and covariates are expected to be time-varying and measured
+#' throughout the course of the study. Therefore if \code{n} is the number of
+#' subjects and \code{T} the number of timepoints, then \code{a}, \code{time},
+#' and \code{id} should all be vectors of length \code{n}x\code{T}, and
+#' \code{x.trt} and \code{x.out} should be matrices with \code{n}x\code{T} rows.
+#' However \code{y} should be a vector of length \code{n} since it is only
+#' measured at the end of the study. The subject ordering should be consistent
+#' across function inputs, based on the ordering specified by \code{id}. See
+#' example below for an illustration.
+#'
+#' @return A list containing the following components:
+#' \item{res}{ estimates/SEs and uniform CIs for population means.}
+#' \item{res.ptwise}{ estimates/SEs and pointwise CIs for population means.}
+#' \item{calpha}{ multiplier bootstrap critical value.}
+#'
+#' @importFrom stats qnorm as.formula
+#' @importFrom ranger ranger
+#'
+#' @export
+#'
+#' @examples
+#' n <- 500
+#' T <- 4
+#'
+#' time <- rep(1:T, n)
+#' id <- rep(1:n, rep(T, n))
+#' x.trt <- matrix(rnorm(n * T * 5), nrow = n * T)
+#' x.out <- matrix(rnorm(n * T * 5), nrow = n * T)
+#' a <- rbinom(n * T, 1, .5)
+#' y <- rnorm(mean=1,n)
+#'
+#' d.seq <- seq(0.1, 5, length.out = 10)
+#'
+#' ipsi.res <- ipsi(y, a, x.trt, x.out, time, id, d.seq)
+#' @references Kennedy EH. Nonparametric causal effects based on incremental
+#' propensity score interventions.
+#' \href{https://arxiv.org/abs/1704.00211}{arxiv:1704.00211}
+#
+ipsi <- function(y, a, x.trt, x.out, time, id, delta.seq,
+                 nsplits = 2, ci_level = 0.95,
+                 progress_bar = TRUE, return_ifvals = FALSE,
+                 fit = "rf",
+                 sl.lib = c("SL.earth", "SL.gam", "SL.glm", "SL.glm.interaction", "SL.mean", "SL.ranger", "SL.rpart")) {
+  
+  require("SuperLearner")
+  require("earth")
+  require("gam")
+  require("ranger")
+  require("rpart")
+  
+  # setup storage
+  ntimes <- length(table(time))
+  end <- max(time)
+  n <- length(unique(id))
+  ynew <- rep(NA, n * ntimes)
+  ynew[time == end] <- y
+  dat <- data.frame(time = time, id = id, y = ynew, a = a)
+  k <- length(delta.seq)
+  ifvals <- matrix(nrow = n, ncol = k)
+  est.eff <- rep(NA, k)
+  wt <- matrix(nrow = n * ntimes, ncol = k)
+  cumwt <- matrix(nrow = n * ntimes, ncol = k)
+  rt <- matrix(nrow = n * ntimes, ncol = k)
+  vt <- matrix(nrow = n * ntimes, ncol = k)
+  x.trt <- data.frame(x.trt)
+  x.out <- data.frame(x.out); x.out$a <- a
+  
+  if (progress_bar) {
+    pb <- txtProgressBar(
+      min = 0, max = 2 * nsplits * length(delta.seq) + 3,
+      style = 3
+    )
+  }
+  
+  s <- sample(rep(seq_len(nsplits), ceiling(n / nsplits))[seq_len(n)])
+  slong <- rep(s, rep(ntimes, n))
+  
+  if (progress_bar) {
+    pbcount <- 0
+  }
+  
+  for (split in seq_len(nsplits)) {
+    if (progress_bar) {
+      Sys.sleep(0.1)
+      setTxtProgressBar(pb, pbcount)
+      pbcount <- pbcount + 1
+    }
+    
+    # fit treatment model
+    if (fit=="rf"){
+      trtmod <- ranger::ranger(stats::as.formula("a ~ ."),
+                               dat = cbind(x.trt, a = dat$a)[slong != split, ])
+      dat$ps <- predict(trtmod, data = x.trt)$predictions
+    }
+    
+    if (fit=="sl"){
+      trtmod <- SuperLearner(dat$a[slong!=split], x.trt[slong!=split,],
+                             newX = x.trt, SL.library = sl.lib, family = binomial)
+      dat$ps <- trtmod$SL.predict
+    }
+    
+    for (j in seq_len(k)) {
+      if (progress_bar) {
+        Sys.sleep(0.1)
+        setTxtProgressBar(pb, pbcount)
+        pbcount <- pbcount + 1
+      }
+      delta <- delta.seq[j]
+      
+      # compute weights
+      wt[, j] <- (delta * dat$a + 1 - dat$a) / (delta * dat$ps + 1 - dat$ps)
+      cumwt[, j] <- as.numeric(t(aggregate(wt[, j],
+                                           by = list(dat$id),
+                                           cumprod
+      )[, -1]))
+      vt[, j] <- (1 - delta) * (dat$a * (1 - dat$ps) -
+                                  (1 - dat$a) * delta * dat$ps) / delta
+      
+      # fit outcome models
+      outmod <- vector("list", ntimes)
+      rtp1 <- dat$y[dat$time == end]
+      if (progress_bar) {
+        Sys.sleep(0.1)
+        setTxtProgressBar(pb, pbcount)
+        pbcount <- pbcount + 1
+      }
+      for (i in seq_len(ntimes)) {
+        t <- rev(unique(dat$time))[i]
+        
+        # counterfactual case for treatment: A = 1
+        newx1 <- x.out[dat$time == t, ]
+        newx1$a <- 1
+        
+        # counterfactual case for no treatment: A = 0
+        newx0 <- x.out[dat$time == t, ]
+        newx0$a <- 0
+        
+        if (fit=="rf"){
+          outmod[[i]] <- ranger::ranger(stats::as.formula("rtp1 ~ ."),
+                                        dat = cbind(x.out,rtp1)[dat$time == t & slong != split, ])
+          m1 <- predict(outmod[[i]], data = newx1)$predictions
+          m0 <- predict(outmod[[i]], data = newx0)$predictions
+        }
+        
+        if (fit=="sl"){
+          print(c(i,j)); flush.console()
+          outmod[[i]] <- SuperLearner(rtp1[s!=split],
+                                      x.out[dat$time==t & slong!=split,],SL.library = sl.lib,
+                                      newX=rbind(newx1,newx0))
+          m1 <- outmod[[i]]$SL.predict[1:dim(newx1)[1]]
+          m0 <- outmod[[i]]$SL.predict[(dim(newx1)[1]+1):(dim(newx1)[1]+dim(newx0)[1])]
+        }
+        
+        pi.t <- dat$ps[dat$time == t]
+        rtp1 <- (delta * pi.t * m1 + (1 - pi.t) * m0) /
+          (delta * pi.t + 1 - pi.t)
+        rt[dat$time == t, j] <- rtp1
+      }
+      # compute influence function values
+      ifvals[s == split, j] <- ((cumwt[, j] * dat$y)[dat$time == end] +
+                                  aggregate(cumwt[, j] * vt[, j] * rt[, j],
+                                            by = list(dat$id), sum
+                                  )[, -1])[s == split]
+    }
+  }
+  
+  # compute estimator
+  for (j in seq_len(k)) {
+    est.eff[j] <- mean(ifvals[, j])
+  }
+  
+  # compute asymptotic variance
+  sigma <- sqrt(apply(ifvals, 2, var))
+  ci_norm_bounds <- abs(stats::qnorm(p = (1 - ci_level) / 2))
+  eff.ll <- est.eff - ci_norm_bounds * sigma / sqrt(n)
+  eff.ul <- est.eff + ci_norm_bounds * sigma / sqrt(n)
+  
+  # multiplier bootstrap
+  if (progress_bar) {
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb, pbcount)
+    pbcount <- pbcount + 1
+  }
+  
+  eff.mat <- matrix(rep(est.eff, n), nrow = n, byrow = TRUE)
+  sig.mat <- matrix(rep(sigma, n), nrow = n, byrow = TRUE)
+  ifvals2 <- (ifvals - eff.mat) / sig.mat
+  nbs <- 10000
+  mult <- matrix(2 * rbinom(n * nbs, 1, 0.5) - 1, nrow = n, ncol = nbs)
+  maxvals <- sapply(seq_len(nbs), function(col) {
+    max(abs(apply(mult[, col] * ifvals2, 2, sum) / sqrt(n)))
+  })
+  calpha <- quantile(maxvals, ci_level)
+  eff.ll2 <- est.eff - calpha * sigma / sqrt(n)
+  eff.ul2 <- est.eff + calpha * sigma / sqrt(n)
+  
+  if (progress_bar) {
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb, pbcount)
+    close(pb)
+  }
+  
+  res <- data.frame(
+    increment = delta.seq, est = est.eff, se = sigma,
+    ci.ll = eff.ll2, ci.ul = eff.ul2
+  )
+  res2 <- data.frame(
+    increment = delta.seq, est = est.eff, se = sigma,
+    ci.ll = eff.ll, ci.ul = eff.ul
+  )
+  
+  # output
+  if (return_ifvals) {
+    return(invisible(list(
+      res = res, res.ptwise = res2, calpha = calpha,
+      ifvals = (ifvals - est.eff)
+    )))
+  } else {
+    return(invisible(list(res = res, res.ptwise = res2, calpha = calpha)))
+  }
+}
+
+
+
+#' @title Estimating bounds on treatment effects with instrumental variables
+#'
+#' @description \code{ivbds} is used to estimate bounds on various effects using instrumental variables.
+#'
+#' @usage ivbds(y, a, z, x, nsplits=2, sl.lib=c("SL.earth","SL.gam","SL.glm","SL.glmnet",
+#'   "SL.glm.interaction", "SL.mean","SL.ranger","rpart"), project01=T)
+#'
+#' @param y outcome of interest.
+#' @param a binary treatment.
+#' @param z binary instrument.
+#' @param x covariate matrix.
+#' @param nsplits integer number of sample splits for nuisance estimation.
+#' If nsplits=1, sample splitting is not used, and nuisance functions are estimated
+#' on full sample (in which case validity of SEs/CIs requires empirical
+#' process conditions). Otherwise must have nsplits>1.
+#' @param sl.lib algorithm library for SuperLearner.
+#' Default library includes "earth", "gam", "glm", "glmnet", "glm.interaction",
+#' "mean", "ranger", "rpart".
+#' @param project01 should the estimated compliance score be projected to space respecting 0-1 bounds and monotonicity?
+#'
+#' @return A list containing the following components:
+#' \item{res}{ estimates/SEs/CIs/p-values for local average treatment effect E(Y(a=1)-Y(a=0)|A(z=1)>A(z=0)), as well as IV strength and sharpness.}
+#' \item{nuis}{ subject-specific estimates of nuisance functions (i.e., IV propensity score and treatment/outcome regressions) }
+#' \item{ifvals}{ matrix of estimated influence function values.}
+#'
+#' @examples
+#' n <- 100; x <- matrix(rnorm(n*5),nrow=n)
+#' z <- rbinom(n,1,0.5); a <- rbinom(n,1,0.6*z+0.2)
+#' y <- rnorm(n)
+#'
+#' ivbds.res <- ivbds(y,a,z,x)
+#'
+#' @references (Also see references for function \code{ate})
+#' @references Angrist JD, Imbens GW, Rubin DB (1996). Identification of causal effects using instrumental variables. \emph{Journal of the American Statistical Association}.
+#' @references Abadie A (2003). Semiparametric instrumental variable estimation of treatment response models. \emph{Journal of Econometrics}.
+#' @references Kennedy EH, Balakrishnan S, G'Sell M (2017). Complier classification with sharp instrumental variables. \emph{Working Paper}.
+#'
+ivbds <- function(y,a,z,x, nsplits=2,
+                  sl.lib=c("SL.earth","SL.gam","SL.glm","SL.glm.interaction","SL.mean","SL.ranger","SL.rpart"),
+                  project01=T){
+  
+  require("SuperLearner")
+  require("earth")
+  require("gam")
+  require("ranger")
+  require("rpart")
+  
+  expit <- function(x){ exp(x)/(1+exp(x)) }
+  logit <- function(x){ log(x/(1-x)) }
+  project.01 <- function(x1,y1){
+    x2 <- x1; y2 <- y1
+    y2[y1>1 & 0<x1 & x1<1] <- 1
+    x2[x1<0 & y1>1] <- 0; y2[x1<0 & y1>1] <- 1
+    x2[x1<0 & 0<y1 & 11] <- 0
+    x2[-x1>y1 & 10] <- 0; y2[-x1>y1 & y1<0] <- 0
+    x2[x1>y1 & y1>-x1 & y1<2-x1] <- (x1+y1)[x1>y1 & y1>-x1 & y1<2-x1]/2
+    y2[x1>y1 & y1>-x1 & y1<2-x1] <- (x1+y1)[x1>y1 & y1>-x1 & y1<2-x1]/2
+    x2[y1>2-x1 & x1>1] <- 1; y2[y1>2-x1 & x1>1] <- 1
+    return(cbind(x2,y2)) }
+  
+  n <- dim(x)[1]
+  pb <- txtProgressBar(min=0, max=4*nsplits, style=3)
+  
+  s <- sample(rep(1:nsplits,ceiling(n/nsplits))[1:n])
+  pihat <- rep(NA,n); la1hat <- rep(NA,n); la0hat <- rep(NA,n)
+  vl1hat <- rep(NA,n); vl0hat <- rep(NA,n)
+  vu1hat <- rep(NA,n); vu0hat <- rep(NA,n)
+  mu1hat <- rep(NA,n); mu0hat <- rep(NA,n)
+  onesided <- sum(a[z==0])==0
+  
+  pbcount <- 0
+  Sys.sleep(0.1); setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+  for (vfold in 1:nsplits){
+    
+    train <- s!=vfold; test <- s==vfold
+    if (nsplits==1){ train <- test }
+    
+    # estimate iv propensity score
+    pifit <- SuperLearner(z[train],as.data.frame(x[train,]),
+                          newX=as.data.frame(x[test,]), SL.library=sl.lib, family=binomial)
+    pihat[test] <- pifit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    
+    # estimate treatment regressions
+    la1fit <- SuperLearner(a[z==1 & train],
+                           as.data.frame(x[z==1 & train,]),
+                           newX=as.data.frame(x[test,]), SL.library=sl.lib)
+    la1hat[test] <- la1fit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    
+    if (!onesided){
+      la0fit <- SuperLearner(a[z==0 & train],
+                             as.data.frame(x[z==0 & train,]),
+                             newX=as.data.frame(x[test,]), SL.library=sl.lib)
+      la0hat[test] <- la0fit$SL.predict }
+    if (onesided){ la0hat[test] <- 0 }
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    
+    # estimate outcome regression
+    mu1fit <- SuperLearner(y[z==1 & train],
+                           as.data.frame(x[z==1 & train,]),
+                           newX=as.data.frame(x[test,]), SL.library=sl.lib)
+    mu1hat[test] <- mu1fit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    
+    mu0fit <- SuperLearner(y[z==0 & train],
+                           as.data.frame(x[z==0 & train,]),
+                           newX=as.data.frame(x[test,]), SL.library=sl.lib)
+    mu0hat[test] <- mu0fit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    
+    # estimate bound variable regressions
+    
+    vu1 <- y*a + 1-a; vu0 <- y*(1-a)
+    vl1 <- y*a; vl0 <- y*(1-a)+a
+    
+    vl1fit <- SuperLearner(vl1[z==1 & train],
+                           as.data.frame(x[z==1 & train,]),
+                           newX=as.data.frame(x[test,]), SL.library=sl.lib)
+    vl1hat[test] <- vl1fit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    
+    vl0fit <- SuperLearner(vl0[z==0 & train],
+                           as.data.frame(x[z==0 & train,]),
+                           newX=as.data.frame(x[test,]), SL.library=sl.lib)
+    vl0hat[test] <- vl0fit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    
+    vu1fit <- SuperLearner(vu1[z==1 & train],
+                           as.data.frame(x[z==1 & train,]),
+                           newX=as.data.frame(x[test,]), SL.library=sl.lib)
+    vu1hat[test] <- vu1fit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    
+    vu0fit <- SuperLearner(vu0[z==0 & train],
+                           as.data.frame(x[z==0 & train,]),
+                           newX=as.data.frame(x[test,]), SL.library=sl.lib)
+    vu0hat[test] <- vu0fit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+  }
+  
+  # project onto 0-1 and la1hat>la0hat space
+  if (project01){
+    newla <- project.01(la0hat,la1hat)
+    la0hat <- newla[,1]; la1hat <- newla[,2] }
+  
+  # compute if vals
+  ifvals.atel <- z*(vl1-vl1hat)/pihat - (1-z)*(vl0-vl0hat)/(1-pihat) + vl1hat-vl0hat
+  ifvals.ateu <- z*(vu1-vu1hat)/pihat - (1-z)*(vu0-vu0hat)/(1-pihat) + vu1hat-vu0hat
+  ifvals.trt <- z*(a-la1hat)/pihat - (1-z)*(a-la0hat)/(1-pihat) + la1hat-la0hat
+  ifvals.out <- z*(y-mu1hat)/pihat - (1-z)*(y-mu0hat)/(1-pihat) + mu1hat-mu0hat
+  muhat <- mean(ifvals.trt)
+  muhat2 <- muhat*(muhat>0.01 & muhat<0.99) + 0.01*(muhat<0.01) + 0.99*(muhat>0.99)
+  q <- quantile(la1hat-la0hat,probs=1-muhat2)
+  hq <- as.numeric( la1hat-la0hat > q)
+  ifvals.hql.num <- (z*(vl1-vl1hat)/pihat - (1-z)*(vl0-vl0hat)/(1-pihat) + vl1hat-vl0hat)*hq
+  ifvals.hqu.num <- (z*(vu1-vu1hat)/pihat - (1-z)*(vu0-vu0hat)/(1-pihat) + vu1hat-vu0hat)*hq
+  nulhat <- vl1hat-vl0hat; nuuhat <- vu1hat-vu0hat; gamhat <- la1hat-la0hat
+  
+  latehat <- mean(ifvals.out)/mean(ifvals.trt)
+  bl.ate <- mean(ifvals.atel); bu.ate <- mean(ifvals.ateu)
+  bl.hq <- mean(ifvals.hql.num)/mean(ifvals.trt); bu.hq <- mean(ifvals.hqu.num)/mean(ifvals.trt)
+  
+  if (bl.ate<= -1){ bl.ate <- -1 }; if (bl.ate> 1){ bl.ate <- 1 }
+  if (bu.ate<= -1){ bu.ate <- -1 }; if (bu.ate> 1){ bu.ate <- 1 }
+  if (bl.hq <= -1){ bl.hq <- -1 }; if (bl.hq > 1){ bl.hq <- 1 }
+  if (bu.hq <= -1){ bu.hq <- -1 }; if (bu.hq > 1){ bu.hq <- 1 }
+  
+  ifvals.late <- (ifvals.out - latehat*ifvals.trt)/mean(ifvals.trt)
+  ifvals.hql <- (ifvals.hql.num - bl.hq*ifvals.trt)/mean(ifvals.trt)
+  ifvals.hqu <- (ifvals.hqu.num - bu.hq*ifvals.trt)/mean(ifvals.trt)
+  
+  lb <- c(bl.ate,bl.hq); ub <- c(bu.ate,bu.hq)
+  se.l <- c(sd(ifvals.atel), sd(ifvals.hql))/sqrt(n)
+  se.u <- c(sd(ifvals.ateu), sd(ifvals.hqu))/sqrt(n)
+  cval <- rep(NA,2); for (j in 1:2){
+    crit <- function(cn){
+      abs(pnorm(cn + (ub[j]-lb[j])/max(se.l[j],se.u[j])) - pnorm(-cn) - 0.95) }
+    (cval[j] <- optimize(crit,c(1,3))$min) }
+  ci.ll <- lb-cval*se.l; ci.ul <- ub+cval*se.u
+  lb <- c(lb,latehat); ub <- c(ub,latehat)
+  ci.ll <- c(ci.ll,latehat-1.96*sd(ifvals.late)/sqrt(n))
+  ci.ul <- c(ci.ul,latehat+1.96*sd(ifvals.late)/sqrt(n))
+  param <- c("ATE", "beta(h_q)", "LATE")
+  res <- data.frame(parameter=param, lb,ub,ci.ll,ci.ul)
+  rownames(res) <- NULL
+  
+  Sys.sleep(0.1)
+  setTxtProgressBar(pb,pbcount)
+  close(pb)
+  
+  nuis <- data.frame(pi=pihat,la1=la1hat,la0=la0hat,hq,gamhat=la1hat-la0hat)
+  
+  print(res)
+  return(invisible(list(res=res, nuis=nuis,
+                        ifvals=data.frame(ifvals.atel,ifvals.ateu,ifvals.hql,ifvals.hqu) )))
+  
+}
+
+#' @title Estimating complier average effect of binary treatment using binary instrument
+#'
+#' @description \code{ivlate} is used to estimate the mean outcome among compliers (i.e., those encouraged by the instrument) had all subjects received treatment versus control.
+#'
+#' @usage ivlate(y, a, z, x, nsplits=2, sl.lib=c("SL.earth","SL.gam","SL.glm","SL.glmnet",
+#'   "SL.glm.interaction", "SL.mean","SL.ranger","rpart"), project01=T)
+#'
+#' @param y outcome of interest.
+#' @param a binary treatment.
+#' @param z binary instrument.
+#' @param x covariate matrix.
+#' @param nsplits integer number of sample splits for nuisance estimation.
+#' If nsplits=1, sample splitting is not used, and nuisance functions are estimated
+#' on full sample (in which case validity of SEs/CIs requires empirical
+#' process conditions). Otherwise must have nsplits>1.
+#' @param sl.lib algorithm library for SuperLearner.
+#' Default library includes "earth", "gam", "glm", "glmnet", "glm.interaction",
+#' "mean", "ranger", "rpart".
+#' @param project01 should the estimated compliance score be projected to space respecting 0-1 bounds and monotonicity?
+#'
+#' @return A list containing the following components:
+#' \item{res}{ estimates/SEs/CIs/p-values for local average treatment effect E(Y(a=1)-Y(a=0)|A(z=1)>A(z=0)), as well as IV strength and sharpness.}
+#' \item{nuis}{ subject-specific estimates of nuisance functions (i.e., IV propensity score and treatment/outcome regressions) }
+#' \item{ifvals}{ matrix of estimated influence function values.}
+#'
+#' @examples
+#' n <- 100; x <- matrix(rnorm(n*5),nrow=n)
+#' z <- rbinom(n,1,0.5); a <- rbinom(n,1,0.6*z+0.2)
+#' y <- rnorm(n)
+#'
+#' ivlate.res <- ivlate(y,a,z,x)
+#'
+#' @references (Also see references for function \code{ate})
+#' @references Angrist JD, Imbens GW, Rubin DB (1996). Identification of causal effects using instrumental variables. \emph{Journal of the American Statistical Association}.
+#' @references Abadie A (2003). Semiparametric instrumental variable estimation of treatment response models. \emph{Journal of Econometrics}.
+#' @references Kennedy EH, Balakrishnan S, G'Sell M (2017). Complier classification with sharp instrumental variables. \emph{Working Paper}.
+#'
+ivlate <- function(y,a,z,x, nsplits=2,
+                   sl.lib=c("SL.earth","SL.gam","SL.glm","SL.glm.interaction","SL.mean","SL.ranger","SL.rpart"),
+                   project01=T){
+  
+  require("SuperLearner")
+  require("earth")
+  require("gam")
+  require("ranger")
+  require("rpart")
+  
+  expit <- function(x){ exp(x)/(1+exp(x)) }
+  logit <- function(x){ log(x/(1-x)) }
+  logx <- function(x){ 2*((x-1)/(x+1) + ((x-1)/(x+1))^3/3 + ((x-1)/(x+1))^5/5
+                          + ((x-1)/(x+1))^7/7 + ((x-1)/(x+1))^9/9 + ((x-1)/(x+1))^11/11)  }
+  project.01 <- function(x1,y1){
+    x2 <- x1; y2 <- y1
+    y2[y1>1 & 0<x1 & x1<1] <- 1
+    x2[x1<0 & y1>1] <- 0; y2[x1<0 & y1>1] <- 1
+    x2[x1<0 & 0<y1 & 11] <- 0
+    x2[-x1>y1 & 10] <- 0; y2[-x1>y1 & y1<0] <- 0
+    x2[x1>y1 & y1>-x1 & y1<2-x1] <- (x1+y1)[x1>y1 & y1>-x1 & y1<2-x1]/2
+    y2[x1>y1 & y1>-x1 & y1<2-x1] <- (x1+y1)[x1>y1 & y1>-x1 & y1<2-x1]/2
+    x2[y1>2-x1 & x1>1] <- 1; y2[y1>2-x1 & x1>1] <- 1
+    return(cbind(x2,y2)) }
+  
+  n <- dim(x)[1]
+  pb <- txtProgressBar(min=0, max=4*nsplits, style=3)
+  
+  s <- sample(rep(1:nsplits,ceiling(n/nsplits))[1:n])
+  pihat <- rep(NA,n); la1hat <- rep(NA,n); la0hat <- rep(NA,n)
+  mu1hat <- rep(NA,n); mu0hat <- rep(NA,n)
+  onesided <- sum(a[z==0])==0
+  
+  pbcount <- 0
+  Sys.sleep(0.1); setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+  for (vfold in 1:nsplits){
+    
+    train <- s!=vfold; test <- s==vfold
+    if (nsplits==1){ train <- test }
+    
+    # estimate iv propensity score
+    pifit <- SuperLearner(z[train],as.data.frame(x[train,]),
+                          newX=as.data.frame(x[test,]), SL.library=sl.lib, family=binomial)
+    pihat[test] <- pifit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    
+    # estimate treatment regression
+    la1fit <- SuperLearner(a[z==1 & train],
+                           as.data.frame(x[z==1 & train,]),
+                           newX=as.data.frame(x[test,]), SL.library=sl.lib)#,family=binomial)
+    la1hat[test] <- la1fit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    
+    if (!onesided){
+      la0fit <- SuperLearner(a[z==0 & train],
+                             as.data.frame(x[z==0 & train,]),
+                             newX=as.data.frame(x[test,]), SL.library=sl.lib)#,family=binomial)
+      la0hat[test] <- la0fit$SL.predict }
+    if (onesided){ la0hat[test] <- 0 }
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    
+    # estimate outcome regression
+    yfam <- "gaussian"; if (length(unique(y))==2){ yfam <- "binomial" }
+    mu1fit <- SuperLearner(y[z==1 & train],
+                           as.data.frame(x[z==1 & train,]),
+                           newX=as.data.frame(x[test,]), SL.library=sl.lib)#, family=yfam)
+    mu1hat[test] <- mu1fit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+    
+    mu0fit <- SuperLearner(y[z==0 & train],
+                           as.data.frame(x[z==0 & train,]),
+                           newX=as.data.frame(x[test,]), SL.library=sl.lib)#, family=yfam)
+    mu0hat[test] <- mu0fit$SL.predict
+    
+    Sys.sleep(0.1)
+    setTxtProgressBar(pb,pbcount); pbcount <- pbcount+1
+  }
+  
+  # project onto 0-1 and la1hat>la0hat space
+  if (project01){
+    newla <- project.01(la0hat,la1hat)
+    la0hat <- newla[,1]; la1hat <- newla[,2] }
+  
+  ifvals.out <- z*(y-mu1hat)/pihat - (1-z)*(y-mu0hat)/(1-pihat) + mu1hat-mu0hat
+  ifvals.trt <- z*(a-la1hat)/pihat - (1-z)*(a-la0hat)/(1-pihat) + la1hat-la0hat
+  ifvals.gam2 <- 2*(la1hat-la0hat)*(z*(a-la1hat)/pihat - (1-z)*(a-la0hat)/(1-pihat)) + (la1hat-la0hat)^2
+  
+  psihat <- mean(ifvals.out)/mean(ifvals.trt)
+  ifvals <- (ifvals.out - psihat*ifvals.trt)/mean(ifvals.trt)
+  muhat <- mean(ifvals.trt); xihat <- mean(ifvals.gam2)
+  
+  muhat2 <- muhat*(muhat>0.01 & muhat<0.99) + 0.01*(muhat<0.01) + 0.99*(muhat>0.99)
+  q <- quantile(la1hat-la0hat,probs=1-muhat2)
+  xihat2 <- mean(ifvals.trt*(la1hat-la0hat>q))
+  sharp2 <- (xihat2-muhat^2)/(muhat-muhat^2)
+  ifvals.sharp2 <- (ifvals.trt*((la1hat-la0hat>q)+q)-xihat2 - q*((la1hat-la0hat>q)-muhat2) )/(muhat-muhat^2) + (2*muhat*xihat2 - xihat2 - muhat^2)*(ifvals.trt - muhat)/((muhat-muhat^2)^2)
+  if (sharp2<0.001){ sharp2 <- 0.001 }; if (sharp2>0.999){ sharp2 <- 0.999 }
+  
+  est <- c(psihat, muhat, sharp2 )
+  se <- c(sd(ifvals), sd(ifvals.trt), sd(ifvals.sharp2))/sqrt(n)
+  ci.ll <- est-1.96*se; ci.ul <- est+1.96*se
+  ci.ll[3] <- expit(logit(sharp2) - 1.96*sd(ifvals.sharp2/(sharp2-sharp2^2))/sqrt(n))
+  ci.ul[3] <- expit(logit(sharp2) + 1.96*sd(ifvals.sharp2/(sharp2-sharp2^2))/sqrt(n))
+  pval <- round(2*(1-pnorm(abs(est/se))),3); pval[2:3] <- NA
+  param <- c("LATE","Strength", "Sharpness")
+  res <- data.frame(parameter=param, est,se,ci.ll,ci.ul,pval)
+  rownames(res) <- NULL
+  
+  Sys.sleep(0.1)
+  setTxtProgressBar(pb,pbcount)
+  close(pb)
+  
+  nuis <- data.frame(pi=pihat,la1=la1hat,la0=la0hat,mu1=mu1hat,mu0=mu0hat)
+  
+  print(res)
+  return(invisible(list(res=res, nuis=nuis, ifvals=as.data.frame(ifvals) )))
+  
+}
+
+
+
+
+#' @title Plot estimated average effect curve for continuous treatment
+#'
+#' @description \code{plot.ctseff} is used to plot results from \code{ctseff} fit.
+#'
+#' @usage plot.ctseff(ctseff.res)
+#'
+#' @param ctseff.res output from \code{ctseff} fit.
+#'
+#' @return A plot of estimated effect curve with pointwise confidence intervals.
+#'
+#' @examples
+#' n <- 500; x <- matrix(rnorm(n*5),nrow=n)
+#' a <- runif(n); y <- a + rnorm(n,sd=.5)
+#'
+#' ce.res <- ctseff(y,a,x, bw.seq=seq(.2,2,length.out=100))
+#' plot.ctseff(ce.res)
+#'
+#' @references Kennedy EH, Ma Z, McHugh MD, Small DS (2017). Nonparametric methods for doubly robust estimation of continuous treatment effects. \emph{Journal of the Royal Statistical Society, Series B}. \href{https://arxiv.org/abs/1507.00747}{arxiv:1507.00747}
+#'
+plot.ctseff <- function(res, xlab="Treatment level A=a",ylab=expression("E( Y"^"a"~")")){
+  
+  plot(res$res$a.vals, res$res$est, type="l",
+       ylim=c(min(res$res$ci.ll), max(res$res$ci.ul)), xlab=xlab, ylab=ylab)
+  lines(res$res$a.vals, res$res$ci.ll,lty=2)
+  lines(res$res$a.vals, res$res$ci.ul,lty=2)
+  
+}
+
+
+#' @title Add Ranger wrapper for SuperLearner
+#'
+#' @description \code{SL.ranger} is a wrapper for \code{SuperLearner} that adds the fast random forests method \code{ranger}.
+#'
+#' @usage SL.ranger(Y, X, newX, family, ...)
+#'
+#' @param Y outcome vector.
+#' @param X covariate dataframe for training.
+#' @param newX covariate dataframe for predictions.
+#' @param family link function (currently only supports "gaussian" identity link).
+#'
+#' @return Predictions and fits from \code{ranger}.
+#'
+#' @references Wright MN, Ziegler A (2016). ranger: A fast implementation of random forests for high dimensional data in C++ and R. \emph{Journal of Statistical Software}.
+#'
+SL.ranger <- function (Y, X, newX, family, ...) {
+  require("ranger")
+  fit.rf <- ranger::ranger(Y ~ ., data=cbind(X,Y))
+  pred <- predict(fit.rf,data=newX)$predictions
+  fit <- list(object = fit.rf)
+  out <- list(pred = pred, fit = fit)
+  class(out$fit) <- c("SL.ranger")
+  return(out) }
+

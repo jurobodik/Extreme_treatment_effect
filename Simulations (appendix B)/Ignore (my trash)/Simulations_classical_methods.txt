@@ -1,0 +1,345 @@
+#Simulations comparing different methods
+#first 100 lines correspond to d=2 case
+#100 - 200 lines correspond to d=10 case
+#200 - 300 lines correspond to d=30 case
+#I did not manage to put it nicely together, since different methods require different imputs 
+#What takes so long is Kennnedy et al method. If you erase that, it will run under a few minutes
+
+
+set.seed(0)#seed for reproducibility
+#we denote by 'g' the patient-specific effect curve \mu_x
+g_function= function(t, c, slope){
+  
+  g = function(h, c, slope){  if(h>=c){return(5 - abs(slope)*(h-c))}
+    if(h<c){return(5 + abs(slope)*(h-c))}}
+  
+  result = c()
+  for(i in 1:length(t)){result = c(result, g(t[i], c, slope))}
+  return(result)}
+#This just computes the absolute relative error of the results in a nice format
+Absolute_relative_error = function(result){
+  result[,2] = result[,2] - result[,1]
+  result[,3] = result[,3] - result[,1]
+  result[,4] = result[,4] - result[,1]
+  result[,5] = result[,5] - result[,1]
+  result[,6] = result[,6] - result[,1]
+  
+  return( c(OUR = mean(abs(result[,2]/result[,1]) ), 
+            GAM = mean(abs(result[,3]/result[,1])),
+            ADD = mean(abs(result[,4]/result[,1])),
+            IPTW = mean(na.omit(abs(result[,5]/result[,1]))), 
+            Kennedy = mean(abs(result[,6]/result[,1])) ))
+  
+}
+
+
+result = c()
+for (j in 1:100) { #number of repetitions of the simulations 
+  
+  n=5000 #sample size
+  d = 2 # Dimension of X
+  correlation_strength <- 0.1  # Strength of correlation between X
+  epsilon_T = rexp(n,  1)
+  
+  # Generate the data
+  cov_matrix <- diag(d); cov_matrix[lower.tri(cov_matrix)] <- correlation_strength ; cov_matrix[upper.tri(cov_matrix)] <- correlation_strength
+  x <- mvrnorm(n, mu = rep(0, d), Sigma = cov_matrix)
+  a=c(); for (i in 1:d) {a=c(a, rnorm(1, 1))}
+  b=c(); for (i in 1:d) {b=c(b, rnorm(1, -1))}
+  
+  t = x%*%a + epsilon_T
+  y = g_function(t, 1, 1)  +x%*%b+rnorm(n, 0, 1)
+  x=data.frame(x); data = data.frame(t, y,x) ; 
+  
+  #Note that we try to estimate mu(max(t+10))
+  result_one_round = c(TRUTH = g_function(max(t+10), 1, 1))
+  result_one_round = c(result_one_round, 
+                       OUR = estimate_mu(value = max(t+10), y, t, x, q=0.95, constant_sigma = TRUE, smooth_parameters = FALSE)
+  )
+  
+  grid_val = seq(max(t+9), max(t+10), by = 1)
+  gam_list <- gam_est(Y = y,treat = t, data = data,grid_val = grid_val,treat_mod = "Normal",
+                      treat_formula = t ~  x[, 1] + x[, 2])
+  result_one_round = c(result_one_round, 
+                       GAM = gam_list$param[length(gam_list$param)]
+  )
+  
+  add_spl_list <- add_spl_est(Y = y,treat = t,data = data,grid_val = grid_val,knot_num = 3, treat_mod = "Normal",
+                              treat_formula = t ~  x[, 1] + x[, 2] )
+  result_one_round = c(result_one_round, 
+                       ADD = add_spl_list$param[length(add_spl_list$param)]
+  )
+  
+  iptw_estimate <- iptw_est(Y = y,  treat = t,numerator_formula = t ~ 1,  data = data,degree = 2, treat_mod = "Normal", link_function = "inverse",
+                            treat_formula = t ~  x[, 1] + x[, 2])
+  result_one_round = c(result_one_round, 
+                       IPTW =   iptw_estimate$param[1] +   max(grid_val)*iptw_estimate$param[2] + max(grid_val)^2*iptw_estimate$param[3]
+  )
+  
+  tryCatch({suppressWarnings({
+    Kennedy_esitmate <- ctseff(y=as.numeric(y), a=as.numeric(t), x, a.rng = c(min(t), max(t+10)), bw.seq = seq(.2, 10, length.out = 10))$res
+  })}, error = function(e) {Kennedy_esitmate})
+  
+  result_one_round = c(result_one_round, 
+                       Kennedy = Kennedy_esitmate$est[length(Kennedy_esitmate$est)]
+  )
+  
+  
+  result = rbind( result, result_one_round )
+  
+  if (j%%1==0) {print(j)}
+}
+Absolute_relative_error(result)
+
+
+
+result = c()
+for (j in 1:100) {
+
+n=5000 #sample size
+d = 10 # Dimension of X
+correlation_strength <- 0.1  # Strength of correlation
+epsilon_T = rexp(n,  1)
+
+# Generate the data
+cov_matrix <- diag(d); cov_matrix[lower.tri(cov_matrix)] <- correlation_strength ; cov_matrix[upper.tri(cov_matrix)] <- correlation_strength
+x <- mvrnorm(n, mu = rep(0, d), Sigma = cov_matrix)
+a=c(); for (i in 1:d) {a=c(a, rnorm(1, 1))}
+b=c(); for (i in 1:d) {b=c(b, rnorm(1, -1))}
+
+t = x%*%a + epsilon_T
+y = g_function(t, 1, 1)  +x%*%b+rnorm(n, 0, 1)
+x=data.frame(x); data = data.frame(t, y,x) ; 
+
+grid_val = seq(max(t+9), max(t+10), by = 1)
+
+result_one_round = c(TRUTH = g_function(max(t+10), 1, 1))
+result_one_round = c(result_one_round, 
+OUR = estimate_mu(value = max(t+10), y, t, x, q=0.95, constant_sigma = TRUE, smooth_parameters = FALSE)
+)
+
+
+gam_list <- gam_est(Y = y,treat = t, data = data,grid_val = grid_val,treat_mod = "Normal",
+                    treat_formula = t ~  x[, 1] + x[, 2] + x[, 3] + x[, 4] + x[, 5] + x[, 6] + x[, 7] + x[, 8] + x[, 9] + x[, 10])
+result_one_round = c(result_one_round, 
+           GAM = gam_list$param[length(gam_list$param)]
+)
+
+add_spl_list <- add_spl_est(Y = y,treat = t,data = data,grid_val = grid_val,knot_num = 3, treat_mod = "Normal",
+                            treat_formula = t ~  x[, 1] + x[, 2] + x[, 3] + x[, 4] + x[, 5] + x[, 6] + x[, 7] + x[, 8] + x[, 9] + x[, 10])
+result_one_round = c(result_one_round, 
+           ADD = add_spl_list$param[length(add_spl_list$param)]
+)
+
+iptw_estimate <- iptw_est(Y = y,  treat = t,numerator_formula = t ~ 1,  data = data,degree = 2, treat_mod = "Normal", link_function = "inverse",
+                          treat_formula = t ~  x[, 1] + x[, 2] + x[, 3] + x[, 4] + x[, 5] + x[, 6] + x[, 7] + x[, 8] + x[, 9] + x[, 10])
+result_one_round = c(result_one_round, 
+                     IPTW =   iptw_estimate$param[1] +   max(grid_val)*iptw_estimate$param[2] + max(grid_val)^2*iptw_estimate$param[3]
+)
+
+tryCatch({suppressWarnings({
+  Kennedy_esitmate <- ctseff(y=as.numeric(y), a=as.numeric(t), x, a.rng = c(min(t), max(t+10)), bw.seq = seq(.2, 10, length.out = 10))$res
+})}, error = function(e) {Kennedy_esitmate})
+
+result_one_round = c(result_one_round, 
+                     Kennedy = Kennedy_esitmate$est[length(Kennedy_esitmate$est)]
+)
+
+
+result = rbind( result, result_one_round )
+
+if (j%%2==0) {print(j)}
+}
+
+Absolute_relative_error(result)
+
+
+result
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+result[,6] = vector <- c(-1.148756e+01,
+                         -7.683326e+00,
+                         -2.143148e+01,
+                         -3.192353e+01,
+                         -2.242298e+01,
+                         -1.922257e+01,
+                         -1.778984e+01,
+                         -7.945393e+00,
+                         -8.391664e+00,
+                         -8.242378e+00,
+                         -1.054558e+01,
+                         -1.508983e+01,
+                         -1.499465e+01,
+                         -2.101685e+01,
+                         -1.523914e+01,
+                         -1.523914e+01,
+                         -3.195551e+01,
+                         -1.044491e+01,
+                         -1.722045e+01,
+                         -1.532649e+01,
+                         -1.566183e+01,
+                         -2.047813e+01,
+                         -1.393624e+01,
+                         -9.331896e+00,
+                         -1.318069e+01,
+                         -2.311924e+01,
+                         -1.377610e+01,
+                         -9.085253e+00,
+                         -2.245252e+01,
+                         -1.098115e+01,
+                         -1.928631e+01,
+                         -1.895027e+01,
+                         -2.068696e+01,
+                         -2.313650e+01,
+                         -1.525341e+01,
+                         -1.458234e+01,
+                         -1.336139e+01,
+                         -1.284822e+01,
+                         -1.345549e+01,
+                         -1.331713e+01,
+                         -1.118932e+01,
+                         -6.610024e+00,
+                         -1.987108e+01,
+                         -2.202837e+01,
+                         -2.281066e+01,
+                         -1.443941e+01,
+                         -1.339728e+01,
+                         -1.512947e+01,
+                         -2.375089e+01,
+                         -1.241801e+01,
+                         -2.242902e+01,
+                         -2.315540e+01,
+                         -1.947922e+01,
+                         -2.113729e+01,
+                         -9.618071e+00,
+                         -1.347659e+01,
+                         -1.206542e+01,
+                         -1.324667e+01,
+                         -4.111815e+00,
+                         -2.330232e+01,
+                         -1.914337e+01,
+                         -1.135906e+01,
+                         -7.814300e+00,
+                         -1.615042e+01,
+                         -1.349248e+01,
+                         -1.848079e+01,
+                         -1.458750e+01,
+                         -1.422685e+01,
+                         -2.790046e+01,
+                         -2.358050e+01,
+                         -1.149253e+01,
+                         -8.130290e+00,
+                         -2.015616e+01,
+                         -3.573794e+01,
+                         -1.874439e+01,
+                         -1.317451e+01,
+                         -1.317451e+01,
+                         -1.065187e+01,
+                         -1.353760e+01,
+                         -1.158586e+01,
+                         -3.203681e+01,
+                         -1.424930e+01,
+                         -8.553201e+00,
+                         -3.653254e+01,
+                         -1.766566e+01,
+                         -2.130402e+01,
+                         -1.002254e+01,
+                         -1.626032e+01,
+                         -1.388857e+01,
+                         -1.284769e+01,
+                         -1.715114e+01,
+                         -1.910335e+01,
+                         -5.702291e+00,
+                         -1.430210e+01,
+                         -1.030393e+01,
+                         -1.739362e+01,
+                         -3.794886e+01,
+                         -1.547735e+01,
+                         -1.540623e+01,
+                         -1.623731e+01)
+
+
+
+
+
+
+
+
+
+
+result = c()
+for (j in 1:100) {
+  
+  n=5000 #sample size
+  d = 30 # Dimension of X
+  correlation_strength <- 0.1  # Strength of correlation
+  epsilon_T = rexp(n,  1)
+  
+  
+  # Generate the data
+  cov_matrix <- diag(d); cov_matrix[lower.tri(cov_matrix)] <- correlation_strength ; cov_matrix[upper.tri(cov_matrix)] <- correlation_strength
+  x <- mvrnorm(n, mu = rep(0, d), Sigma = cov_matrix)
+  a=c(); for (i in 1:d) {a=c(a, rnorm(1, 1))}
+  b=c(); for (i in 1:d) {b=c(b, rnorm(1, -1))}
+  
+  t = x%*%a + epsilon_T
+  y = g_function(t, 1, 1)  +x%*%b+rnorm(n, 0, 1)
+  x=data.frame(x); data = data.frame(t, y,x) ; 
+  
+  grid_val = seq(max(t+9), max(t+10), by = 1)
+  
+  result_one_round = c(TRUTH = g_function(max(t+10), 1, 1))
+  result_one_round = c(result_one_round, 
+                       OUR = estimate_mu(value = max(t+10), y, t, x,q=0.95, constant_sigma = TRUE, smooth_parameters = FALSE)
+  )
+  
+  
+  gam_list <- gam_est(Y = y,treat = t, data = data,grid_val = grid_val,treat_mod = "Normal",
+                      treat_formula = t ~  x[, 1] + x[, 2] + x[, 3] + x[, 4] + x[, 5] + x[, 6] + x[, 7] + x[, 8] + x[, 9] + x[, 10] + x[, 11] + x[, 12] + x[,13] + x[, 14] + x[, 15] + x[, 16] + x[, 17] + x[, 18] +  x[,19] + x[, 20] + x[, 21] + x[, 22] + x[, 23] + x[, 24] + x[,25] + x[, 26] + x[, 27] + x[, 28] + x[, 29] + x[, 30])
+  result_one_round = c(result_one_round, 
+                       GAM = gam_list$param[length(gam_list$param)]
+  )
+  
+  add_spl_list <- add_spl_est(Y = y,treat = t,data = data,grid_val = grid_val,knot_num = 3, treat_mod = "Normal",
+                              treat_formula = t ~ x[, 1] + x[, 2] + x[, 3] + x[, 4] + x[, 5] + x[, 6] + x[, 7] + x[, 8] + x[, 9] + x[, 10] + x[, 11] + x[, 12] + x[,13] + x[, 14] + x[, 15] + x[, 16] + x[, 17] + x[, 18] +  x[,19] + x[, 20] + x[, 21] + x[, 22] + x[, 23] + x[, 24] + x[,25] + x[, 26] + x[, 27] + x[, 28] + x[, 29] + x[, 30])
+  result_one_round = c(result_one_round, 
+                       ADD = add_spl_list$param[length(add_spl_list$param)]
+  )
+  
+  iptw_estimate <- iptw_est(Y = y,  treat = t,numerator_formula = t ~ 1,  data = data,degree = 2, treat_mod = "Normal", link_function = "inverse",
+                            treat_formula = t ~  x[, 1] + x[, 2] + x[, 3] + x[, 4] + x[, 5] + x[, 6] + x[, 7] + x[, 8] + x[, 9] + x[, 10] + x[, 11] + x[, 12] + x[,13] + x[, 14] + x[, 15] + x[, 16] + x[, 17] + x[, 18] +  x[,19] + x[, 20] + x[, 21] + x[, 22] + x[, 23] + x[, 24] + x[,25] + x[, 26] + x[, 27] + x[, 28] + x[, 29] + x[, 30])
+  result_one_round = c(result_one_round, 
+                       IPTW =   iptw_estimate$param[1] +   max(grid_val)*iptw_estimate$param[2] + max(grid_val)^2*iptw_estimate$param[3]
+  )
+  
+  result_one_round = c(result_one_round, 
+                       Kennedy = 10000000
+  )
+  
+  
+  result = rbind( result, result_one_round )
+  
+  if (j%%2==0) {print(j)}
+}
+Absolute_relative_error(result)
+

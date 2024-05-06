@@ -1,0 +1,592 @@
+#This R code contains the simulations presented in our manuscirpt 'Extremal treatment effect'
+#They serve more for reproducibility purposes; if you are here to use the method, you might be more interested in the script 'Simple example'
+
+#Lines 1 - 115 serve to upload libraries and to upload functions 'estimate omega' and 'bootstrap' which are our main functions that we use 
+#Lines 115 - 200 concern Simulations B.1 about high-dimensional confounders
+#Lines 200 - 300 concern Simulations B.2 about the comparision with other methods
+#Lines 300 - 400 concern Simulations B.3 about dependence structure which is a generalization of 'simple example'
+#Lines 400 - 500 concern Simulations B.4 about hidden confounder
+#Lines 500 - 600 concern Simulations B.5 about varying extremal region: different \mu(t) and robustness against its misspecification
+
+library(quantreg)
+library(raster)
+library(ambient)
+library(dplyr)
+library(rgl)
+library(evgam)
+library(mgcv)
+library(Pareto)
+library(evmix)
+library(boot)
+library(copula)
+library(MASS)
+library(causaldrf)
+
+set.seed(0)
+
+
+
+estimate_omega <- function(y,t,x, q, constant_sigma=FALSE, smooth_parameters = FALSE){ 
+  d = ncol(x) ; if(is.null(d)){d=1}; 
+  
+  #tau estimation
+  if(d==1){  
+    if(smooth_parameters==FALSE){  fit <- rqss(t~x, data = data.frame(x,t), tau =q) }
+    if(smooth_parameters==TRUE){   fit <- rqss(t~qss(x), data = data.frame(x,t), tau =q)}
+  }
+  if(d>1){   
+    if(smooth_parameters==FALSE){formula <- as.formula(paste("t~", paste("x[,", 1:d, "]", collapse = " + ")))}
+    if(smooth_parameters==TRUE){  formula <- as.formula(paste("t~", paste0("qss(X", 1:d, ")", collapse = " + ")))}
+    fit <- rqss(formula, data = data.frame(x,t), tau =q) #fit = rqss(t~x1+x2+x3)
+  }
+  
+  
+  t_excess = c()
+  t_excess_index = c()
+  tau = fitted(fit) #tau is the estimated \hat{\tau}(x_i)
+  for (i in 1:length(y)) {
+    if (t[i]> tau[i]) {t_excess_index = c(t_excess_index, i); t_excess = c(t_excess, t[i]- tau[i])}
+  } 
+  
+  Y_S = y[t_excess_index]
+  T_S = t[t_excess_index]
+  tau_S = tau[t_excess_index]  
+  
+  # GPD sigma and xi estimation
+  if(d>1 & constant_sigma==FALSE){   
+    A = t_excess
+    B=c()
+    for (i in 1:d) {
+      B = cbind(B, x[t_excess_index, i] )
+    }
+    B = data.frame(B); names(B) = paste0("B", 1:d)
+    
+    if(smooth_parameters==FALSE){formula <- as.formula(paste("A~", paste0("B", 1:d, "", collapse = " + ")))}
+    if(smooth_parameters==TRUE){formula <- as.formula(paste("A~", paste0("s(B", 1:d, ")", collapse = " + ")))}
+    
+    fit2 = evgam( list(formula, ~ 1), data =data.frame(A, B), family="gpd"  )
+    sigma_S = exp(fitted(fit2)[,1])
+  }
+  
+  #Step 2: Final regression
+  
+  if(constant_sigma==TRUE & smooth_parameters == FALSE)   fit3 = gam(Y_S ~ tau_S +tau_S*T_S)
+  if(constant_sigma==TRUE & smooth_parameters == TRUE)    fit3 = gam(Y_S ~ s(tau_S) +s(tau_S, by=T_S))  
+  if(constant_sigma==FALSE & smooth_parameters == FALSE)  fit3 = gam(Y_S ~ tau_S*sigma_S +tau_S*sigma_S*T_S)
+  if(constant_sigma==FALSE & smooth_parameters == TRUE)   fit3 = gam(Y_S ~ s(tau_S, sigma_S) +s(tau_S, sigma_S, by=T_S))
+  
+  result = c()
+  for (i in 1:length(Y_S)) {
+    
+    if(constant_sigma==TRUE & smooth_parameters == FALSE)   { patient_specific_result = fit3$coefficients[3] + fit3$coefficients[4]*tau_S[i] 
+    result = c(result,  patient_specific_result)}
+    if(constant_sigma==FALSE & smooth_parameters == FALSE)   { patient_specific_result = fit3$coefficients[4] + fit3$coefficients[6]*tau_S[i]  +  fit3$coefficients[7]*sigma_S[i] +  fit3$coefficients[8]*tau_S[i]*sigma_S[i]
+    result = c(result,  patient_specific_result)}
+    if(smooth_parameters == TRUE)   {predict_fit = predict(fit3,  type="terms" ,se.fit = FALSE, newdata = data.frame(tau_S = tau_S[i], sigma_S=sigma_S[i], T_S = 1000000000))
+    result = c(result,  predict_fit[2]/1000000000)}
+    
+  }
+  
+  return(    mean(result)       )
+}
+
+bootstrap <- function(y,t,x, q=0.9, Bootstrap_size=100, constant_sigma=FALSE, smooth_parameters = FALSE, show_time=TRUE){
+  
+  f <- function(data){ estimate_omega(data$y, data$t, data$x, q = q, constant_sigma, smooth_parameters)[1]  }
+  data = data.frame(y,t,x)
+  
+  result = c()
+  for (i in 1:Bootstrap_size) {
+    z = sample_n(data, size = length(y), replace = TRUE) ;     z$x = z[, -c(1,2)]
+    result = c(result, f(z))
+    if(show_time==TRUE & i%%10 ==0)  cat('Step: ', "\r",Bootstrap_size-i)
+  }
+  result = as.numeric( result ); 
+  
+  result2 = result[abs(result)<median(abs(result)) + 5*quantile(abs(result), 0.75)]
+  
+  data = data.frame(y,t,x); data$x = data[, -c(1,2)]
+  
+  Conf_int_upper = quantile(result2, 0.95);
+  Conf_int_lower = quantile(result2, 0.05);
+  
+  return( data.frame(Lower_conf_int=as.numeric(Conf_int_lower ),Upper_conf_int=as.numeric(Conf_int_upper)))
+  
+}
+
+
+
+
+
+#Simulations with a high dimensional X
+#Change dimension $d$ or the distribution of epsilon_T for different values in the table 
+
+set.seed(0)
+result = c()
+for (j in 1:100) {
+  
+  
+  n=5000 #sample size
+  q = 0.95 #We estimate threshold tau as a q-quantile. This is the only hyperparameter that we have to choose. It represents the bias-variance trade off
+  omega = 1
+  d = 50 # Dimension of X
+  correlation_strength <- 0.1  # Strength of correlation
+  epsilon_T = rexp(n, 0.1)
+  
+  
+  #we denote by 'g' the patient-specific effect curve \mu_x
+  g_function= function(t, c, slope){
+    
+    g = function(h, c, slope){  if(h>=c){return(5 - abs(slope)*(h-c))}
+      if(h<c){return(5 + abs(slope)*(h-c))}}
+    
+    result = c()
+    for(i in 1:length(t)){result = c(result, g(t[i], c, slope))}
+    return(result)}
+  
+  
+  
+  # Generate the covariance matrix with a slight correlation
+  cov_matrix <- diag(d); cov_matrix[lower.tri(cov_matrix)] <- correlation_strength ; cov_matrix[upper.tri(cov_matrix)] <- correlation_strength
+  x <- mvrnorm(n, mu = rep(0, d), Sigma = cov_matrix)
+  a=c(); for (i in 1:d) {a=c(a, rnorm(1, 1))}
+  b=c(); for (i in 1:d) {b=c(b, rnorm(1, -1))}
+  
+  t = x%*%a + epsilon_T
+  y = g_function(t, 1, omega)  +x%*%b+rnorm(n, 0, 1)
+  x=data.frame(x); data = data.frame(t, y,x) ; 
+  
+  #lm(y~t + x[, 1] + x[, 2] + x[, 3] + x[, 4] + x[, 5] + x[, 6] + x[, 7] + x[, 8] + x[, 9] + x[, 10] + x[, 11] + x[, 12] + x[,13] + x[, 14] + x[, 15] + x[, 16] + x[, 17] + x[, 18] +  x[,19] + x[, 20] + x[, 21] + x[, 22] + x[, 23] + x[, 24] + x[,25] + x[, 26] + x[, 27] + x[, 28] + x[, 29] + x[, 30] + x[, 31] + x[, 32] +x[, 33] + x[, 34] + x[, 35] + x[, 36] + x[, 37] + x[, 38] + x[, 39] +    x[, 40] + x[, 41] + x[, 42] + x[, 43] + x[, 44] + x[, 45] + x[, 46] +  x[, 47] + x[, 48] + x[, 49] + x[, 50])
+  
+  result = c(result, estimate_omega(y, t, x, q, constant_sigma = FALSE, smooth_parameters = FALSE))
+  if (j%%10==0) {print(j)}
+}
+
+cat(mean(result), quantile(result, 0.95)-mean(result))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#Simulations comparing different methods
+#Our method has to be uploaded from the 'Main functions' file, Kennedy et al method has to be uploaded from the file 'Kennedy et al method' and other methods are just taken from library(causaldrf)
+#In order to obtain other values from the table, change $d$ and change treat_formula to treat_formula = t ~  x[, 1] + x[, 2] +...+x[, d]
+#What takes so long is Kennnedy et al method. If you erase that, it will run under a few minutes. If d=30 then Kennedy et al will take too long (one simulation took more than a day on my computer, and repeating this 100 times would take at least a few months unless using better equipment)
+
+library(causaldrf)
+set.seed(0)#seed for reproducibility
+#we denote by 'g' the patient-specific effect curve \mu_x
+g_function= function(t, c, slope){
+  
+  g = function(h, c, slope){  if(h>=c){return(5 - abs(slope)*(h-c))}
+    if(h<c){return(5 + abs(slope)*(h-c))}}
+  
+  result = c()
+  for(i in 1:length(t)){result = c(result, g(t[i], c, slope))}
+  return(result)}
+#This just computes the absolute relative error of the results in a nice format
+Absolute_relative_error = function(result){
+  result[,2] = result[,2] - result[,1]
+  result[,3] = result[,3] - result[,1]
+  result[,4] = result[,4] - result[,1]
+  result[,5] = result[,5] - result[,1]
+  result[,6] = result[,6] - result[,1]
+  
+  return( c(OUR = mean(abs(result[,2]/result[,1]) ), 
+            GAM = mean(abs(result[,3]/result[,1])),
+            ADD = mean(abs(result[,4]/result[,1])),
+            IPTW = mean(na.omit(abs(result[,5]/result[,1]))), 
+            Kennedy = mean(abs(result[,6]/result[,1])) ))
+  
+}
+
+
+result = c()
+for (j in 1:100) { #number of repetitions of the simulations 
+  
+  n=5000 #sample size
+  d = 2 # Dimension of X
+  correlation_strength <- 0.1  # Strength of correlation between X
+  epsilon_T = rexp(n,  1)
+  
+  # Generate the data
+  cov_matrix <- diag(d); cov_matrix[lower.tri(cov_matrix)] <- correlation_strength ; cov_matrix[upper.tri(cov_matrix)] <- correlation_strength
+  x <- mvrnorm(n, mu = rep(0, d), Sigma = cov_matrix)
+  a=c(); for (i in 1:d) {a=c(a, rnorm(1, 1))}
+  b=c(); for (i in 1:d) {b=c(b, rnorm(1, -1))}
+  
+  t = x%*%a + epsilon_T
+  y = g_function(t, 1, 1)  +x%*%b+rnorm(n, 0, 1)
+  x=data.frame(x); data = data.frame(t, y,x) ; 
+  
+  #Note that we try to estimate mu(max(t+10))
+  result_one_round = c(TRUTH = g_function(max(t+10), 1, 1))
+  result_one_round = c(result_one_round, 
+                       OUR = estimate_mu(value = max(t+10), y, t, x, q=0.95, constant_sigma = TRUE, smooth_parameters = FALSE)
+  )
+  
+  grid_val = seq(max(t+9), max(t+10), by = 1)
+  gam_list <- gam_est(Y = y,treat = t, data = data,grid_val = grid_val,treat_mod = "Normal",
+                      treat_formula = t ~  x[, 1] + x[, 2])
+  result_one_round = c(result_one_round, 
+                       GAM = gam_list$param[length(gam_list$param)]
+  )
+  
+  add_spl_list <- add_spl_est(Y = y,treat = t,data = data,grid_val = grid_val,knot_num = 3, treat_mod = "Normal",
+                              treat_formula = t ~  x[, 1] + x[, 2] )
+  result_one_round = c(result_one_round, 
+                       ADD = add_spl_list$param[length(add_spl_list$param)]
+  )
+  
+  iptw_estimate <- iptw_est(Y = y,  treat = t,numerator_formula = t ~ 1,  data = data,degree = 2, treat_mod = "Normal", link_function = "inverse",
+                            treat_formula = t ~  x[, 1] + x[, 2])
+  result_one_round = c(result_one_round, 
+                       IPTW =   iptw_estimate$param[1] +   max(grid_val)*iptw_estimate$param[2] + max(grid_val)^2*iptw_estimate$param[3]
+  )
+  
+  tryCatch({suppressWarnings({
+    Kennedy_esitmate <- ctseff(y=as.numeric(y), a=as.numeric(t), x, a.rng = c(min(t), max(t+10)), bw.seq = seq(.2, 10, length.out = 10))$res
+  })}, error = function(e) {Kennedy_esitmate})
+  
+  result_one_round = c(result_one_round, 
+                       Kennedy = Kennedy_esitmate$est[length(Kennedy_esitmate$est)]
+  )
+  
+  
+  result = rbind( result, result_one_round )
+  
+  if (j%%1==0) {print(j)}
+}
+Absolute_relative_error(result)
+
+
+
+
+
+
+
+
+
+
+# Simulations regarding 'Dependence, sample size and the causal effect'
+#Change omega, n or alpha for different values in the table
+set.seed(0)
+omega=10
+n=1000
+alpha = 1
+number_of_repetitions=100 #This is how much we want to wait
+bootstrap_size = 100 #This is for bootstrap
+q = 0.95; if(n<=1000)  q=0.9
+
+#Here is the code for generating a random function. We use Perlin noise approach for its generation
+#EXPLANATION VIA EXAMPLE FOR GENERATING random function f(x1, x2, x3): 
+#x1=rnorm(n); x2 = rnorm(n); x3=rnorm(n)
+#f1 = random_function_3d()
+#evaluation_of_f_3d(f1, x1, x2, x3) #THIS IS f(X1, X2, X3), WHERE f IS RANDOMLY GENERATED
+
+
+random_function_3d<-function(){
+  f <- long_grid(seq(-10, 10, length.out = 50),seq(-10, 10, length.out = 50), seq(-10, 10, length.out = 50))
+  f$noise <- 1000*(gen_perlin(f$x, f$y, f$z, frequency = 0.01, fractal = 'fbm'))^2+ 5000*(gen_perlin(f$x, f$y, f$z, frequency = 0.01, fractal = 'fbm'))^2
+  f$noise = f$noise +abs(f$x*f$y*f$z)^(0.5)+f$x*f$y*f$z #This is here to normalize gen_perlin a bit. 
+  return(f) }
+
+
+evaluation_of_f_3d<-function(f,X1,X2,X3){
+  
+  function_evaluated_in_x_y_z<-function(f,x,y,z){
+    index <- which.min( sqrt((f$x - x)^2 + (f$y - y)^2 + (f$z - z)^2) )
+    return(f$noise[index])
+  }
+  
+  result=c()
+  for (i in 1:length(X1)) {
+    result = c(result, function_evaluated_in_x_y_z(f, X1[i], X2[i],X3[i])  )
+  }
+  return(result)
+}                
+
+result = c()
+result2 = c()
+for (k in 1:number_of_repetitions) {
+  
+  gumbel.cop <- evCopula(family = 'gumbel', alpha, dim = 4)
+  myMvd <- mvdc(copula=gumbel.cop, margins=c("exp", "norm", "norm", "norm"),
+                paramMargins=list(list(1),
+                                  list(mean = 0, sd = 1), list(mean = 0, sd = 1), list(mean = 0, sd = 1))
+  )
+  Z <- rMvdc(n, myMvd)
+  t=Z[,1]; x1 = Z[,2]; x2 = Z[,3]; x3 = Z[,4]; 
+  x= data.frame(x1, x2, x3)
+  f1 = random_function_3d()
+  y = 0.5*omega*t*(x1>0) + 1.5*omega*t*(x1<0) + evaluation_of_f_3d(f1, x1, x2, x3) +  rnorm(n)
+  
+  
+  estimate_omega(y,t,x, q = q)
+  
+  result = c(result, estimate_omega(y,t,x, q = q, constant_sigma = FALSE, smooth_parameters = FALSE))
+  result2 = c(result2, bootstrap(y,t,x,Bootstrap_size=bootstrap_size, q =q, show_time = FALSE)$Upper_conf_int)
+  
+  if(k%%2==0)cat("\r",k)
+}
+result = as.numeric(result)
+result2 = as.numeric(result2)
+
+mean(result)
+quantile(result, 0.95) - mean(result)
+mean(result2) -mean(result) 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#This R code contains two cases: Simulations from Section 'Simulations with a hidden confounder' and 'Simple Example'
+#'Simple Example' is a special case when $delta = 0$ and $omega = 1.25$
+#To reproduce Table from the Section 'Simulations with a hidden confounder', simply choose $n$, $delta$, $omega$ and run the code. 
+n=1000
+omega = 0
+delta = 0
+q = 0.9
+
+
+final_result = c(); number_of_repetitions = 20 #In the end, we chose only 20, since the results were remarkably similar
+set.seed(1)
+for (i in 1:number_of_repetitions) {
+  
+  h = rnorm(n, 1, 1)
+  x = rbinom(prob = 0.75, size=1,  n); 
+  t = delta*h + x + rnorm(n)
+  y = delta*h +omega*2/3*t*(x==1)*(t>1) + omega*2*t*(x==0)*(t>1) -1*t*(t<1) +1*(t<1) +rnorm(n, 0, 1)
+  
+  x=data.frame(x); data = data.frame(t, y,x) ; x1=x; x=data$x; y=data$y; t=data$t
+  
+  #Estimation of the threshold tau as the 90% quantile
+  fit <- rqss(t~x, data = data.frame(x,t), tau =q) #here, tau is the threshold. Its a bit confusing
+  
+  #Computing the set S
+  t_excess = c()
+  t_excess_index = c()
+  estimated_threshold = fitted(fit)
+  for (i in 1:length(y)) {
+    if (t[i]> estimated_threshold[i]) {t_excess_index = c(t_excess_index, i); t_excess = c(t_excess, t[i]- estimated_threshold[i])}
+  } 
+  
+  
+  #GPD sigma and xi estimation
+  A = x[t_excess_index]
+  fit2 = evgam( list(t_excess~ A, ~ 1), family="gpd", data=data.frame(A, t_excess)  )
+  
+  #alpha and beta estimation
+  threshold =  fitted(fit)[t_excess_index]  
+  Y = y[t_excess_index]
+  Tr = t[t_excess_index]
+  Theta = exp(fitted(fit2)[,1])
+  # fit3 = gam(Y ~ s(threshold, Theta) +s(threshold, Theta, by=Tr)) #Normally we would use this. However, since we have just one confounder that is binary, we get Error 'A term has fewer unique covariate combinations than specified maximum degrees of freedom'. 
+  fit3 = gam(Y ~ threshold +threshold*Tr) #Hence, we use this. Note that if you compute theta, you will end up with a vector of just two values theta=(1.22, 3.44, 1.22,1.22,1.22, 3.44, 1.22, 3.44, 1.22, 3.44 ) while threshold=(0,1,0,0,0,1,0,1,0,1). Hence, in the regression it will be the same and we need just threshold 
+  
+  #mu(t) expression
+  result = c(); 
+  for (i in 1:length(Y)) {
+    patient_specific_result = fit3$coefficients[3] + fit3$coefficients[4]*threshold[i] 
+    
+    result = c(result,  patient_specific_result); 
+  }
+  final_result = c(final_result,  mean(result))
+}
+
+summary(final_result)
+cat( 'hat(omega) = ',mean(final_result), ',     and 95% quantile = ', quantile(final_result, 0.95)-mean(final_result))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#Simulations with varying extremal region
+
+#we denote by 'g' the patient-specific effect curve \mu_x
+g = function(t, c, slope){  if(t>=c){return(5 - abs(slope)*(t-c))}
+  if(t<c){return(5 + abs(slope)*(t-c))}}
+
+#First, we generate the plot of the function \mu_x
+{n=10000
+  
+  X = runif(n, 0, 4) #This is just for plot, not X as covariate
+  Y=c(); for (i in 1:n) {  Y=c(Y, g(X[i], 2, 3))}
+  plot(Y~X, ylab = expression(mu[x](t)), xlab = 't', cex = 0.5, cex.lab = 1.1, main = 'Effect of T on Y')
+  text(2, +0, 'c', pos = 1, cex = 2, col = 'red')
+  abline(v = 2, col = 'blue', lty = 2)
+  text(2.8, 3, '-Slope(x)', col = 'red', pos = 4)
+  text(0.2, 3, 'Slope(x)', col = 'red', pos = 4)
+}
+
+#This is just a nice visualisation of data. You can ignore it if you are just replicating data
+plot_me <- function(){
+  fit <- rqss(t~x, data = data.frame(x,t), tau =q)
+  t_excess_index = c()
+  for (i in 1:(n-1)) {
+    if (t[i]> fitted(fit)[i]) {t_excess_index = c(t_excess_index, i)}
+  } 
+  plot(y~t, lwd=2)
+  points(y[t_excess_index]~t[t_excess_index], col = 'blue', pch = 22, lwd = 2, cex=1.5)
+  legend("bottomright", legend = c('x1=1', "x1=0"), col = c("black", "red"), pch = 16)
+}
+
+#Next, we define the automatic procedure for the esimation of omega
+#Yes, this is the old version of the function 'estimate_omega' but we were too lazy to redo it
+hat_omega <- function(y,t,x, tau=0.95, constant_theta=FALSE){ 
+  
+  fit <- rqss(t~x, data = data.frame(x,t), tau =q) #here, tau and q are a bit confusing. Here, tau is just a name of parameter of the function rqss
+  estimated_threshold = fitted(fit) #THIS IS tau(x). We can check that it correctly estimates the coefficient beta=1
+  
+  
+  #Computing the set S
+  t_excess = c()
+  t_excess_index = c()
+  for (i in 1:length(y)) {
+    if (t[i]> estimated_threshold[i]) {t_excess_index = c(t_excess_index, i); t_excess = c(t_excess, t[i]- estimated_threshold[i])}
+  } 
+  
+  
+  #GPD sigma and xi estimation
+  A = x[t_excess_index]
+  fit2 = evgam( list(t_excess~ s(A), ~ 1), family="gpd", data=data.frame(A, t_excess)  ) 
+  
+  #alpha and beta estimation
+  threshold =  fitted(fit)[t_excess_index]  
+  Y = y[t_excess_index]
+  Tr = t[t_excess_index]
+  Theta = exp(fitted(fit2)[,1])
+  
+  fit3 = gam(Y ~ threshold +threshold*Tr) #Again, we use this instead of fit3 = gam(Y ~ s(threshold, Theta) +s(threshold, Theta, by=Tr)). Why? In the case with one confounder,  
+  
+  #mu(t) expression
+  result = c(); 
+  for (i in 1:length(Y)) {
+    patient_specific_result = fit3$coefficients[3] + fit3$coefficients[4]*threshold[i] 
+    
+    result = c(result,  patient_specific_result); 
+  }
+  return( mean(result) )
+}
+
+set.seed(1)
+c=2
+nu = 2
+n=10000
+q=0.9
+
+result=c()
+for (j in 1:50) {
+  x = rnorm(n, 0, 1)
+  t = x + rt(n,nu,1)
+  y=c(); for (i in 1:n) {y=c(y,        g(t[i], c, x[i])+rnorm(1)            )}
+  
+  result=c(result, hat_omega(y,t,x,q))
+  #if (j%%10==0) {print(j)}
+  
+}
+#plot_me()
+#lm(y~t+x)
+
+
+#result
+cat(mean(result), quantile(result, 0.95)[1] - mean(result)) #you should get \hat{\omega} = -0.76\pm 0.23
+
+
+

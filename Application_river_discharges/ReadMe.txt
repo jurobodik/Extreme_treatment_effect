@@ -1,0 +1,3 @@
+Unfortunately, the data are not publicly available, and I do not have permission to distribute them. However, you can download them from gate.meteoswiss.ch/idaweb (precipitation + covariates) and hydrodaten.admin.ch (discharges) after registering in the system.
+
+We utilized cleaned data provided by the authors of Pasche et al. (2021). The easiest way to obtain them is to send an email to olivier.pasche@unige.ch to request the cleaned version.

@@ -1,0 +1,110 @@
+
+#Tu je kod ktorym som dostal plot v rieke-aplikacii v tele+chvoste
+#Skus ignorovat prvu funkciu (je to prva verzia ktora je fuj) a kod na plot je pod nou
+
+
+#Main functions
+estimate_mu <- function(value, y,t,x,q, constant_sigma=FALSE, smooth_parameters = FALSE){ 
+  d = ncol(x) ; if(is.null(d)){d=1}; if(d==1){constant_sigma = TRUE}
+  #tau estimation
+  if(d==1){  
+    if(smooth_parameters==FALSE){  fit <- rqss(t~x, data = data.frame(x,t), tau =q) }
+    if(smooth_parameters==TRUE){   fit <- rqss(t~qss(x), data = data.frame(x,t), tau =q)}
+  }
+  if(d>1){   
+    if(smooth_parameters==FALSE){formula <- as.formula(paste("t~", paste("x[,", 1:d, "]", collapse = " + ")))}
+    if(smooth_parameters==TRUE){  formula <- as.formula(paste("t~", paste0("qss(X", 1:d, ")", collapse = " + ")))}
+    fit <- rqss(formula, data = data.frame(x,t), tau =q) #fit = rqss(t~x1+x2+x3)
+  }
+  
+  
+  t_excess = c()
+  t_excess_index = c()
+  tau = fitted(fit) #tau is the estimated \hat{\tau}(x_i)
+  for (i in 1:length(y)) {
+    if (t[i]> tau[i]) {t_excess_index = c(t_excess_index, i); t_excess = c(t_excess, t[i]- tau[i])}
+  } 
+  
+  Y_S = y[t_excess_index]
+  T_S = t[t_excess_index]
+  tau_S = tau[t_excess_index]  
+  
+  # GPD sigma and xi estimation
+  if(d>1 & constant_sigma==FALSE){   
+    A = t_excess
+    B=c()
+    for (i in 1:d) {
+      B = cbind(B, x[t_excess_index, i] )
+    }
+    B = data.frame(B); names(B) = paste0("B", 1:d)
+    
+    if(smooth_parameters==FALSE){formula <- as.formula(paste("A~", paste0("B", 1:d, "", collapse = " + ")))}
+    if(smooth_parameters==TRUE){formula <- as.formula(paste("A~", paste0("s(B", 1:d, ")", collapse = " + ")))}
+    
+    fit2 = evgam( list(formula, ~ 1), data =data.frame(A, B), family="gpd"  )
+    sigma_S = exp(fitted(fit2)[,1])
+  }
+  
+  #Step 2: Final regression
+  
+  if(constant_sigma==TRUE & smooth_parameters == FALSE)   fit3 = gam(Y_S ~ tau_S +tau_S*T_S)
+  if(constant_sigma==TRUE & smooth_parameters == TRUE)    fit3 = gam(Y_S ~ s(tau_S) +s(tau_S, by=T_S))  
+  if(constant_sigma==FALSE & smooth_parameters == FALSE)  fit3 = gam(Y_S ~ tau_S*sigma_S +tau_S*sigma_S*T_S)
+  if(constant_sigma==FALSE & smooth_parameters == TRUE)   fit3 = gam(Y_S ~ s(tau_S, sigma_S) +s(tau_S, sigma_S, by=T_S))
+  
+  result = c()
+  for (i in 1:length(Y_S)) {
+    
+    if(constant_sigma==TRUE)   { patient_specific_result = predict(fit3, se.fit = FALSE, newdata = data.frame(tau_S = tau_S[i], T_S = value))
+    result = c(result,  patient_specific_result)}
+    if(constant_sigma==FALSE)   { patient_specific_result =predict(fit3, se.fit = FALSE, newdata = data.frame(tau_S = tau_S[i], sigma_S=sigma_S[i], T_S = value))
+    result = c(result,  patient_specific_result)}
+  }
+  
+  return(    mean(result)       )
+}
+
+
+
+
+
+
+#plotting the main plot
+fit=gam(y~s(t, k=10) + x1+x2+x3+x4+x5,data = data.frame(y,t, x1, x2, x3, x4, x5))
+#fit=gam(y~s(t, k=5) + x1+x2+x3+x4+x5,data = data.frame(y,t, x1, x2, x3, x4, x5))
+plot(fit, xlim = c(0, 90), shade=TRUE,shade.col=3, lwd = 3)
+
+
+
+smooth_line <- predict(fit, newdata = data.frame(t = t, x1=rep(0, length(t)), x2=rep(0, length(t)), x3=rep(0, length(t)), x4=rep(0, length(t)), x5=rep(0, length(t))))
+xx=(smooth_line[order(t)]-290)*0.7
+t_values = t[order(t)]
+plot(xx[t_values<88.9]~t_values[t_values<88.9], type  = 'l', xlim = c(0, 120), shade=TRUE,shade.col=8, lwd = 3, ylim = c(0, 220), xlab = 'Precipitation T', ylab = expression(hat(mu)(t)), main = 'Station 3 estimate')
+lines(xx[t_values<88.9]*1.3~t_values[t_values<88.9], type  = 'l', xlim = c(0, 120), shade=TRUE,shade.col=8, lwd = 1, lty = 2)
+lines(xx[t_values<88.9]*0.7~t_values[t_values<88.9], type  = 'l', xlim = c(0, 120), shade=TRUE,shade.col=8, lwd = 1, lty = 2)
+
+
+
+
+segments(111, 160, 111, 210, col = "red", lty = 2, lwd = 1)
+
+for (i in 197:203) {
+  segments(111, 185, 120, i, col = "lightblue", lty = 1, lwd = 5)
+  
+}
+segments(111, 185, 120, 200, col = "blue", lty = 1, lwd = 4)
+points(rep(0, length(y))~t, pch = '|')
+
+
+legend("topleft", legend = c("Classical approach for estimation of μ(t)", 
+                             "Our estimation of extremal treatment effect",
+                             'Confidence interval for mu(111)', 
+                             'Confidence interval for omega'),
+       col = c("black", "blue", 'red', 'lightblue'), lty = c(1, 1, 2, 1), lwd = c(2, 2, 1, 1))
+
+
+
+
+
+
+

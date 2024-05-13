@@ -7,8 +7,6 @@ You can find the following files here:
 
 'Simple example' contains an explanation of the code on a simple example
 
-'engression graph' contains code for the generation of the graphs drawn in Section 3.2
-
 'Simulations' folder contains all simulations for reproducibility purposes
 
 'Application ' folders contain all relevant details about the two real-data applications mentioned in the manuscript

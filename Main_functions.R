@@ -7,20 +7,12 @@
 #                   'bootstrap_mu', which computes the confidence intervals for estimate_mu. 
 #For explanation of detailed steps, see the script 'Simple Example' where we explain step-by-step each part of the code, this code here serves just for you to use for your data without any nuisances
 
-
 library(quantreg)
-library(raster)
-library(ambient)
-library(dplyr)
-library(rgl)
 library(evgam)
 library(mgcv)
 library(Pareto)
 library(evmix)
-library(boot)
-library(copula)
 library(MASS)
-library(causaldrf)
 
 
 #Example
